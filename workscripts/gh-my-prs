@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# List GitHub PRs assigned to me or requesting my review
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_gh
+
+MODE="${1:-all}"
+
+case "$MODE" in
+    review)
+        header "PRs requesting my review"
+        gh search prs --review-requested=@me --state=open \
+            --json repository,number,title,author,updatedAt,url \
+            --template '{{range .}}{{printf "%-40s" .repository.nameWithOwner}}  #{{printf "%-6d" .number}}  {{printf "%-50s" .title}}  {{printf "%-15s" .author.login}}  {{timeago .updatedAt}}{{"\n"}}{{end}}'
+        ;;
+    authored)
+        header "My open PRs"
+        gh search prs --author=@me --state=open \
+            --json repository,number,title,updatedAt,url \
+            --template '{{range .}}{{printf "%-40s" .repository.nameWithOwner}}  #{{printf "%-6d" .number}}  {{printf "%-50s" .title}}  {{timeago .updatedAt}}{{"\n"}}{{end}}'
+        ;;
+    all|*)
+        header "PRs requesting my review"
+        gh search prs --review-requested=@me --state=open \
+            --json repository,number,title,author,updatedAt \
+            --template '{{range .}}{{printf "%-40s" .repository.nameWithOwner}}  #{{printf "%-6d" .number}}  {{printf "%-50s" .title}}  {{printf "%-15s" .author.login}}  {{timeago .updatedAt}}{{"\n"}}{{end}}'
+        echo ""
+        header "My open PRs"
+        gh search prs --author=@me --state=open \
+            --json repository,number,title,updatedAt \
+            --template '{{range .}}{{printf "%-40s" .repository.nameWithOwner}}  #{{printf "%-6d" .number}}  {{printf "%-50s" .title}}  {{timeago .updatedAt}}{{"\n"}}{{end}}'
+        ;;
+esac

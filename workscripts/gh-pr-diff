@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# View the diff of a GitHub PR
+# Usage: gh-pr-diff <repo> <pr-number>
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_gh
+
+REPO="${1:-}"
+PR_NUM="${2:-}"
+
+[[ -n "$REPO" ]] || die "Usage: gh-pr-diff <owner/repo> <pr-number>"
+[[ -n "$PR_NUM" ]] || die "Usage: gh-pr-diff <owner/repo> <pr-number>"
+
+if [[ "$REPO" != */* ]]; then
+    need_org
+    REPO="${GH_ORG}/${REPO}"
+fi
+
+header "Diff for PR #${PR_NUM} in ${REPO}"
+gh pr diff "$PR_NUM" --repo "$REPO"

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Common functions and config loading for work scripts
+
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# Load config
+CONF_FILE="${WORK_CONF:-$HOME/.workscripts.conf}"
+if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+fi
+
+GH_ORG="${GH_ORG:-}"
+JIRA_URL="${JIRA_URL:-}"
+JIRA_PROJECT="${JIRA_PROJECT:-}"
+
+die() {
+    echo -e "${RED}Error: $1${RESET}" >&2
+    exit 1
+}
+
+info() {
+    echo -e "${BLUE}$1${RESET}"
+}
+
+header() {
+    echo ""
+    echo -e "${BOLD}${CYAN}$1${RESET}"
+    echo -e "${DIM}$(printf '%.0s─' $(seq 1 ${#1}))${RESET}"
+}
+
+need_gh() {
+    command -v gh &>/dev/null || die "gh CLI not found. Install: brew install gh"
+    gh auth status &>/dev/null 2>&1 || die "Not logged in to gh. Run: gh auth login"
+}
+
+need_acli() {
+    command -v acli &>/dev/null || die "acli not found. Install Atlassian CLI first."
+}
+
+need_org() {
+    [[ -n "$GH_ORG" ]] || die "GH_ORG not set. Configure it in ~/.workscripts.conf"
+}

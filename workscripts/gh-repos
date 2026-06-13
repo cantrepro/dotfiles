@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# List GitHub repos of the configured org
+# Usage: gh-repos [search-term]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_gh
+need_org
+
+SEARCH="${1:-}"
+LIMIT="${2:-50}"
+
+header "Repos in ${GH_ORG}"
+
+if [[ -n "$SEARCH" ]]; then
+    info "Filtering by: $SEARCH"
+    echo ""
+    gh repo list "$GH_ORG" --limit "$LIMIT" \
+        --json name,description,isPrivate,updatedAt,primaryLanguage \
+        --jq ".[] | select(.name | test(\"${SEARCH}\"; \"i\")) | \"\(.name)\t\(.primaryLanguage.name // \"-\")\t\(.description // \"\")\"" \
+        | column -t -s $'\t'
+else
+    gh repo list "$GH_ORG" --limit "$LIMIT" \
+        --json name,description,isPrivate,updatedAt,primaryLanguage \
+        --template '{{range .}}{{printf "%-40s" .name}}  {{printf "%-12s" (or .primaryLanguage.name "-")}}  {{.description}}{{"\n"}}{{end}}'
+fi

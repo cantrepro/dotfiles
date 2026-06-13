@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# View comments on a GitHub PR (including review comments)
+# Usage: gh-pr-comments <repo> <pr-number>
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_gh
+
+REPO="${1:-}"
+PR_NUM="${2:-}"
+
+[[ -n "$REPO" ]] || die "Usage: gh-pr-comments <owner/repo> <pr-number>"
+[[ -n "$PR_NUM" ]] || die "Usage: gh-pr-comments <owner/repo> <pr-number>"
+
+if [[ "$REPO" != */* ]]; then
+    need_org
+    REPO="${GH_ORG}/${REPO}"
+fi
+
+header "Comments on PR #${PR_NUM} in ${REPO}"
+echo ""
+
+# Issue-level comments
+echo -e "${BOLD}General comments:${RESET}"
+gh api "repos/${REPO}/issues/${PR_NUM}/comments" \
+    --jq '.[] | "───────────────────────────────────────\n\(.user.login)  \(.updated_at)\n\n\(.body)\n"' 2>/dev/null || echo "  (none)"
+
+echo ""
+
+# Review comments (inline code comments)
+echo -e "${BOLD}Review comments:${RESET}"
+gh api "repos/${REPO}/pulls/${PR_NUM}/comments" \
+    --jq '.[] | "───────────────────────────────────────\n\(.user.login)  \(.updated_at)\n\(.path):\(.line // .original_line // "?")\n\n\(.body)\n"' 2>/dev/null || echo "  (none)"

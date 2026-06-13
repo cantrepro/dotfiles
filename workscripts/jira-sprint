@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# View current sprint tickets
+# Usage: jira-sprint [project]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_acli
+
+PROJECT="${1:-$JIRA_PROJECT}"
+
+header "Current Sprint"
+
+JQL="sprint in openSprints() AND resolution = Unresolved ORDER BY status ASC, priority DESC"
+if [[ -n "$PROJECT" ]]; then
+    JQL="project = ${PROJECT} AND ${JQL}"
+fi
+
+acli jira workitem search --jql "$JQL" \
+    --fields "key,summary,status,assignee,priority"

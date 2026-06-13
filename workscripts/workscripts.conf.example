@@ -1,0 +1,15 @@
+# Work scripts configuration
+# Copy this to ~/.workscripts.conf and fill in your values
+
+# GitHub org name
+GH_ORG="my-company"
+
+# Jira base URL (used for linking)
+JIRA_URL="https://mycompany.atlassian.net"
+
+# Jira project key(s) - space separated for defaults
+JIRA_PROJECT="PROJ"
+
+# SSH remote execution (used by rwork)
+WORK_SSH_HOST="user@macbook.local"
+WORK_REMOTE_DIR="/Users/you/workscripts"

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# View GitHub notifications
+# Usage: gh-notifications [--all]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_gh
+
+header "GitHub Notifications"
+
+if [[ "${1:-}" == "--all" ]]; then
+    gh api notifications --jq '.[] | "\(.repository.full_name)  \(.subject.type)  \(.subject.title)"'
+else
+    # Only unread
+    gh api notifications --jq '.[] | select(.unread) | "\(.repository.full_name)  \(.subject.type)  \(.subject.title)"'
+fi

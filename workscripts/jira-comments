@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# View comments on a Jira ticket
+# Usage: jira-comments <ticket-key>
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_acli
+
+TICKET="${1:-}"
+[[ -n "$TICKET" ]] || die "Usage: jira-comments <ticket-key>  (e.g., PROJ-123)"
+
+if [[ "$TICKET" =~ ^[0-9]+$ ]]; then
+    [[ -n "$JIRA_PROJECT" ]] || die "Bare number given but JIRA_PROJECT not set in ~/.workscripts.conf"
+    TICKET="${JIRA_PROJECT}-${TICKET}"
+fi
+
+header "Comments on ${TICKET}"
+
+acli jira workitem comment list --key "$TICKET"

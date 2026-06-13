@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Remote work launcher - runs work commands on remote Mac via SSH
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+
+# Validate SSH config
+WORK_SSH_HOST="${WORK_SSH_HOST:-}"
+WORK_REMOTE_DIR="${WORK_REMOTE_DIR:-}"
+[[ -n "$WORK_SSH_HOST" ]] || die "WORK_SSH_HOST not set. Configure it in ~/.workscripts.conf"
+[[ -n "$WORK_REMOTE_DIR" ]] || die "WORK_REMOTE_DIR not set. Configure it in ~/.workscripts.conf"
+
+run_remote() {
+    local cmd="$WORK_REMOTE_DIR/work"
+    for arg in "$@"; do
+        cmd+=" $(printf '%q' "$arg")"
+    done
+    # Use login interactive shell to pick up PATH from .zshrc/.zprofile
+    ssh -t "$WORK_SSH_HOST" "zsh -lic $(printf '%q' "$cmd")"
+}
+
+show_menu() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  Remote Work Scripts${RESET}  ${DIM}($WORK_SSH_HOST)${RESET}"
+    echo -e "${DIM}  ────────────────────────────────────${RESET}"
+    echo ""
+    echo -e "  ${BOLD}GitHub${RESET}"
+    echo -e "    ${GREEN}1${RESET}  My PRs (assigned + authored)"
+    echo -e "    ${GREEN}2${RESET}  View a PR"
+    echo -e "    ${GREEN}3${RESET}  PR comments"
+    echo -e "    ${GREEN}4${RESET}  PR diff"
+    echo -e "    ${GREEN}5${RESET}  PR CI checks"
+    echo -e "    ${GREEN}6${RESET}  Org repos"
+    echo -e "    ${GREEN}7${RESET}  Notifications"
+    echo ""
+    echo -e "  ${BOLD}Jira${RESET}"
+    echo -e "    ${GREEN}8${RESET}  My tickets"
+    echo -e "    ${GREEN}9${RESET}  View a ticket"
+    echo -e "    ${GREEN}10${RESET} Ticket comments"
+    echo -e "    ${GREEN}11${RESET} Current sprint"
+    echo ""
+    echo -e "    ${GREEN}q${RESET}  Quit"
+    echo ""
+}
+
+prompt_repo_pr() {
+    read -rp "  Repo (name or owner/repo): " repo
+    read -rp "  PR number: " pr_num
+}
+
+prompt_ticket() {
+    read -rp "  Ticket key (e.g., PROJ-123): " ticket
+}
+
+run_loop() {
+    while true; do
+        show_menu
+        read -rp "  Choose: " choice
+        echo ""
+
+        case "$choice" in
+            1)  run_remote prs ;;
+            2)  prompt_repo_pr;  run_remote pr "$repo" "$pr_num" ;;
+            3)  prompt_repo_pr;  run_remote comments "$repo" "$pr_num" ;;
+            4)  prompt_repo_pr;  run_remote diff "$repo" "$pr_num" ;;
+            5)  prompt_repo_pr;  run_remote checks "$repo" "$pr_num" ;;
+            6)
+                read -rp "  Search filter (empty for all): " search
+                run_remote repos "$search"
+                ;;
+            7)  run_remote notifications ;;
+            8)  run_remote tickets ;;
+            9)  prompt_ticket;   run_remote ticket "$ticket" ;;
+            10) prompt_ticket;   run_remote jcomments "$ticket" ;;
+            11) run_remote sprint ;;
+            q|Q|quit|exit)
+                echo -e "${DIM}  bye${RESET}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}  Invalid choice${RESET}"
+                ;;
+        esac
+
+        echo ""
+        read -rp "  Press Enter to continue..."
+    done
+}
+
+# Direct subcommand dispatch or interactive menu
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        help|-h|--help)
+            echo "Usage: rwork [command] [args...]"
+            echo ""
+            echo "Runs work commands on $WORK_SSH_HOST via SSH."
+            echo ""
+            echo "Commands (or run without args for interactive menu):"
+            echo "  prs                     List PRs assigned to me"
+            echo "  pr <repo> <num>         View a PR"
+            echo "  comments <repo> <num>   View PR comments"
+            echo "  diff <repo> <num>       View PR diff"
+            echo "  checks <repo> <num>     View PR CI checks"
+            echo "  repos [search]          List org repos"
+            echo "  notifications           View notifications"
+            echo "  tickets [project]       List my Jira tickets"
+            echo "  ticket <key>            View a Jira ticket"
+            echo "  jcomments <key>         View Jira ticket comments"
+            echo "  sprint [project]        View current sprint"
+            ;;
+        *)
+            run_remote "$@"
+            ;;
+    esac
+else
+    run_loop
+fi

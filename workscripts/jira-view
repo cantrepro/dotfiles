@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# View a Jira ticket
+# Usage: jira-view <ticket-key>  (e.g., jira-view PROJ-123)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_acli
+
+TICKET="${1:-}"
+[[ -n "$TICKET" ]] || die "Usage: jira-view <ticket-key>  (e.g., PROJ-123)"
+
+# If just a number is given, prepend default project
+if [[ "$TICKET" =~ ^[0-9]+$ ]]; then
+    [[ -n "$JIRA_PROJECT" ]] || die "Bare number given but JIRA_PROJECT not set in ~/.workscripts.conf"
+    TICKET="${JIRA_PROJECT}-${TICKET}"
+fi
+
+header "Jira: ${TICKET}"
+
+acli jira workitem view "$TICKET"
+
+if [[ -n "$JIRA_URL" ]]; then
+    echo ""
+    echo -e "${DIM}${JIRA_URL}/browse/${TICKET}${RESET}"
+fi

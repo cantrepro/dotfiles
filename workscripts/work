@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Main work menu - interactive launcher for all work scripts
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+
+show_menu() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  Work Scripts${RESET}"
+    echo -e "${DIM}  ────────────────────────────────────${RESET}"
+    echo ""
+    echo -e "  ${BOLD}GitHub${RESET}"
+    echo -e "    ${GREEN}1${RESET}  My PRs (assigned + authored)"
+    echo -e "    ${GREEN}2${RESET}  View a PR"
+    echo -e "    ${GREEN}3${RESET}  PR comments"
+    echo -e "    ${GREEN}4${RESET}  PR diff"
+    echo -e "    ${GREEN}5${RESET}  PR CI checks"
+    echo -e "    ${GREEN}6${RESET}  Org repos"
+    echo -e "    ${GREEN}7${RESET}  Notifications"
+    echo ""
+    echo -e "  ${BOLD}Jira${RESET}"
+    echo -e "    ${GREEN}8${RESET}  My tickets"
+    echo -e "    ${GREEN}9${RESET}  View a ticket"
+    echo -e "    ${GREEN}10${RESET} Ticket comments"
+    echo -e "    ${GREEN}11${RESET} Current sprint"
+    echo ""
+    echo -e "    ${GREEN}q${RESET}  Quit"
+    echo ""
+}
+
+prompt_repo_pr() {
+    read -rp "  Repo (name or owner/repo): " repo
+    read -rp "  PR number: " pr_num
+}
+
+prompt_ticket() {
+    read -rp "  Ticket key (e.g., PROJ-123): " ticket
+}
+
+run_loop() {
+    while true; do
+        show_menu
+        read -rp "  Choose: " choice
+        echo ""
+
+        case "$choice" in
+            1)
+                "$SCRIPT_DIR/gh-my-prs"
+                ;;
+            2)
+                prompt_repo_pr
+                "$SCRIPT_DIR/gh-pr-view" "$repo" "$pr_num"
+                ;;
+            3)
+                prompt_repo_pr
+                "$SCRIPT_DIR/gh-pr-comments" "$repo" "$pr_num"
+                ;;
+            4)
+                prompt_repo_pr
+                "$SCRIPT_DIR/gh-pr-diff" "$repo" "$pr_num"
+                ;;
+            5)
+                prompt_repo_pr
+                "$SCRIPT_DIR/gh-pr-checks" "$repo" "$pr_num"
+                ;;
+            6)
+                read -rp "  Search filter (empty for all): " search
+                "$SCRIPT_DIR/gh-repos" "$search"
+                ;;
+            7)
+                "$SCRIPT_DIR/gh-notifications"
+                ;;
+            8)
+                "$SCRIPT_DIR/jira-my-tickets"
+                ;;
+            9)
+                prompt_ticket
+                "$SCRIPT_DIR/jira-view" "$ticket"
+                ;;
+            10)
+                prompt_ticket
+                "$SCRIPT_DIR/jira-comments" "$ticket"
+                ;;
+            11)
+                "$SCRIPT_DIR/jira-sprint"
+                ;;
+            q|Q|quit|exit)
+                echo -e "${DIM}  bye${RESET}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}  Invalid choice${RESET}"
+                ;;
+        esac
+
+        echo ""
+        read -rp "  Press Enter to continue..."
+    done
+}
+
+# Allow direct subcommand dispatch: work prs, work repos, etc.
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        prs)        shift; "$SCRIPT_DIR/gh-my-prs" "$@" ;;
+        pr)         shift; "$SCRIPT_DIR/gh-pr-view" "$@" ;;
+        comments)   shift; "$SCRIPT_DIR/gh-pr-comments" "$@" ;;
+        diff)       shift; "$SCRIPT_DIR/gh-pr-diff" "$@" ;;
+        checks)     shift; "$SCRIPT_DIR/gh-pr-checks" "$@" ;;
+        repos)      shift; "$SCRIPT_DIR/gh-repos" "$@" ;;
+        notif*)     shift; "$SCRIPT_DIR/gh-notifications" "$@" ;;
+        tickets)    shift; "$SCRIPT_DIR/jira-my-tickets" "$@" ;;
+        ticket)     shift; "$SCRIPT_DIR/jira-view" "$@" ;;
+        jcomments)  shift; "$SCRIPT_DIR/jira-comments" "$@" ;;
+        sprint)     shift; "$SCRIPT_DIR/jira-sprint" "$@" ;;
+        help|-h|--help)
+            echo "Usage: work [command] [args...]"
+            echo ""
+            echo "Commands (or run without args for interactive menu):"
+            echo "  prs                     List PRs assigned to me"
+            echo "  pr <repo> <num>         View a PR"
+            echo "  comments <repo> <num>   View PR comments"
+            echo "  diff <repo> <num>       View PR diff"
+            echo "  checks <repo> <num>     View PR CI checks"
+            echo "  repos [search]          List org repos"
+            echo "  notifications           View notifications"
+            echo "  tickets [project]       List my Jira tickets"
+            echo "  ticket <key>            View a Jira ticket"
+            echo "  jcomments <key>         View Jira ticket comments"
+            echo "  sprint [project]        View current sprint"
+            ;;
+        *)
+            echo "Unknown command: $1 (try: work help)"
+            exit 1
+            ;;
+    esac
+else
+    run_loop
+fi

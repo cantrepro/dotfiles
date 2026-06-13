@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# View a GitHub PR's details
+# Usage: gh-pr-view <repo> <pr-number>
+#    or: gh-pr-view <owner/repo> <pr-number>
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_gh
+
+REPO="${1:-}"
+PR_NUM="${2:-}"
+
+[[ -n "$REPO" ]] || die "Usage: gh-pr-view <owner/repo> <pr-number>"
+[[ -n "$PR_NUM" ]] || die "Usage: gh-pr-view <owner/repo> <pr-number>"
+
+# If repo doesn't contain a slash, prepend the org
+if [[ "$REPO" != */* ]]; then
+    need_org
+    REPO="${GH_ORG}/${REPO}"
+fi
+
+header "PR #${PR_NUM} in ${REPO}"
+
+gh pr view "$PR_NUM" --repo "$REPO" --comments

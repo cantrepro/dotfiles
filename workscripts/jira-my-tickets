@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# List Jira tickets assigned to me
+# Usage: jira-my-tickets [project]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/work-common"
+need_acli
+
+PROJECT="${1:-$JIRA_PROJECT}"
+
+header "My Jira tickets"
+
+JQL="assignee = currentUser() AND resolution = Unresolved ORDER BY priority DESC, updated DESC"
+if [[ -n "$PROJECT" ]]; then
+    JQL="project = ${PROJECT} AND ${JQL}"
+fi
+
+acli jira workitem search --jql "$JQL" \
+    --fields "key,summary,status,priority,issuetype"
