@@ -34,46 +34,12 @@ run_command "ln -sf /var/lib/libvirt/images ~/kvm" "Create symlink for KVM image
 run_command "sudo chown -R root:root scripts" "Set ownership of scripts directory to root."
 run_command "sudo chown -R root:root ~/bin" "Set ownership of ~/bin directory to root."
 
-SECURE_PATH_LINE='Defaults    secure_path="/usr/local/sbin:/usr/local/bin:/usr/bin:/home/user/bin"'
-SUDOERS_FILE="/etc/sudoers"
-TEMP_SUDOERS=$(mktemp)
-
-echo "INFO: Checking and updating sudoers secure_path..."
-if sudo grep -q '^Defaults    secure_path=' "$SUDOERS_FILE"; then
-    if ! sudo grep 'Defaults    secure_path=.*:/home/user/bin' "$SUDOERS_FILE"; then
-        echo "INFO: Adding /home/user/bin to existing secure_path in $SUDOERS_FILE"
-        sudo cp "$SUDOERS_FILE" "$TEMP_SUDOERS"
-        sudo sed -i 's|^\(Defaults    secure_path=".*\)"|\1:/home/user/bin"|' "$TEMP_SUDOERS"
-        if sudo visudo -cf "$TEMP_SUDOERS"; then
-            sudo cp "$TEMP_SUDOERS" "$SUDOERS_FILE"
-            echo "SUCCESS: Updated secure_path in $SUDOERS_FILE."
-        else
-            echo "ERROR: Failed to validate temporary sudoers file. No changes made to $SUDOERS_FILE."
-            rm -f "$TEMP_SUDOERS"
-            exit 1
-        fi
-        rm -f "$TEMP_SUDOERS"
-    else
-        echo "INFO: /home/user/bin already in secure_path in $SUDOERS_FILE."
-    fi
-else
-    echo "INFO: Adding new secure_path with /home/user/bin to $SUDOERS_FILE"
-    echo "$SECURE_PATH_LINE" | sudo tee -a "$TEMP_SUDOERS" > /dev/null
-    if sudo visudo -cf "$TEMP_SUDOERS"; then
-        sudo sh -c "cat '$TEMP_SUDOERS' >> '$SUDOERS_FILE'"
-        echo "SUCCESS: Added secure_path to $SUDOERS_FILE."
-    else
-        echo "ERROR: Failed to validate temporary sudoers file. No changes made to $SUDOERS_FILE."
-        rm -f "$TEMP_SUDOERS"
-        exit 1
-    fi
-    rm -f "$TEMP_SUDOERS"
-fi
-
 run_command "sudo cp ./static/resolvconf.conf /etc/resolvconf.conf" "Copy resolvconf configuration."
 run_command "sudo resolvconf -u" "Update resolvconf."
 run_command "sudo cp ./static/main.conf /etc/iwd/main.conf" "Copy iwd configuration."
 run_command "sudo systemctl restart iwd" "Restart iwd service."
+
+run_command "sudo ./scripts/addbintopath" "Adding bin directory to secure path."
 
 echo "INFO: All setup tasks completed successfully."
 exit 0
