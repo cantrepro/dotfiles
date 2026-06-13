@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+enable_forward() {
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+}
+
+add_port_forward() {
+  local wan_if="$1"
+  local host_ip="$2"
+  local host_port="$3"
+  local vm_if="$4"
+  local vm_ip="$5"
+  local vm_port="$6"
+
+  iptables -t nat -I PREROUTING 1 -i "$wan_if" -p tcp -d "$host_ip" --dport "$host_port" \
+    -j DNAT --to-destination "$vm_ip:$vm_port"
+
+  iptables -I FORWARD 1 -i "$wan_if" -o "$vm_if" -p tcp -d "$vm_ip" --dport "$vm_port" \
+    -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+
+  iptables -I FORWARD 2 -i "$vm_if" -o "$wan_if" -p tcp -s "$vm_ip" --sport "$vm_port" \
+    -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+}
+
+remove_port_forward() {
+  local wan_if="$1"
+  local host_ip="$2"
+  local host_port="$3"
+  local vm_if="$4"
+  local vm_ip="$5"
+  local vm_port="$6"
+
+  iptables -t nat -D PREROUTING -i "$wan_if" -p tcp -d "$host_ip" --dport "$host_port" \
+    -j DNAT --to-destination "$vm_ip:$vm_port" || true
+
+  iptables -D FORWARD -i "$wan_if" -o "$vm_if" -p tcp -d "$vm_ip" --dport "$vm_port" \
+    -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT || true
+
+  iptables -D FORWARD -i "$vm_if" -o "$wan_if" -p tcp -s "$vm_ip" --sport "$vm_port" \
+    -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
+}
+
+add_local_hairpin() {
+  local host_ip="$1"
+  local host_port="$2"
+  local vm_ip="$3"
+  local vm_port="$4"
+
+  iptables -t nat -I OUTPUT 1 -p tcp -d "$host_ip" --dport "$host_port" \
+    -j DNAT --to-destination "$vm_ip:$vm_port"
+}
+
+remove_local_hairpin() {
+  local host_ip="$1"
+  local host_port="$2"
+  local vm_ip="$3"
+  local vm_port="$4"
+
+  iptables -t nat -D OUTPUT -p tcp -d "$host_ip" --dport "$host_port" \
+    -j DNAT --to-destination "$vm_ip:$vm_port" || true
+}
+
+read -p 'Enable or disable? (1 for enable, 0 for disable): ' optype
+
+WAN_IF_DEFAULT="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+HOST_IP_DEFAULT="192.168.1.149"
+VM_IF_DEFAULT="virbr10"
+VM_IP_DEFAULT="192.168.23.2"
+HOST_PORT_DEFAULT="8080"
+VM_PORT_DEFAULT="8080"
+
+read -p "Wi-Fi interface? [${WAN_IF_DEFAULT}]: " WAN_IF
+WAN_IF="${WAN_IF:-$WAN_IF_DEFAULT}"
+
+read -p "Host IP on home Wi-Fi? [${HOST_IP_DEFAULT}]: " HOST_IP
+HOST_IP="${HOST_IP:-$HOST_IP_DEFAULT}"
+
+read -p "VM bridge interface? [${VM_IF_DEFAULT}]: " VM_IF
+VM_IF="${VM_IF:-$VM_IF_DEFAULT}"
+
+read -p "VM IP? [${VM_IP_DEFAULT}]: " VM_IP
+VM_IP="${VM_IP:-$VM_IP_DEFAULT}"
+
+read -p "Host port to expose? [${HOST_PORT_DEFAULT}]: " HOST_PORT
+HOST_PORT="${HOST_PORT:-$HOST_PORT_DEFAULT}"
+
+read -p "VM service port? [${VM_PORT_DEFAULT}]: " VM_PORT
+VM_PORT="${VM_PORT:-$VM_PORT_DEFAULT}"
+
+read -p 'Also forward connections originating from the host itself? (1=yes, 0=no) [0]: ' HAIRPIN
+HAIRPIN="${HAIRPIN:-0}"
+
+if [[ "$optype" == "1" ]]; then
+  enable_forward
+  add_port_forward "$WAN_IF" "$HOST_IP" "$HOST_PORT" "$VM_IF" "$VM_IP" "$VM_PORT"
+  if [[ "$HAIRPIN" == "1" ]]; then
+    add_local_hairpin "$HOST_IP" "$HOST_PORT" "$VM_IP" "$VM_PORT"
+  fi
+  echo "Forward enabled: ${HOST_IP}:${HOST_PORT} -> ${VM_IP}:${VM_PORT} via ${WAN_IF}/${VM_IF}"
+else
+  remove_port_forward "$WAN_IF" "$HOST_IP" "$HOST_PORT" "$VM_IF" "$VM_IP" "$VM_PORT"
+  if [[ "$HAIRPIN" == "1" ]]; then
+    remove_local_hairpin "$HOST_IP" "$HOST_PORT" "$VM_IP" "$VM_PORT"
+  fi
+  echo "Forward removed: ${HOST_IP}:${HOST_PORT} -> ${VM_IP}:${VM_PORT}"
+fi
+
+exit 0
