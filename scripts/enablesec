@@ -12,6 +12,6 @@ find /boot/loader/entries -type f -name '*.conf' ! -name '*fallback*' | while re
             sudo sed -i "/^options / s/$/ $kernel_params/" "$conf_file"
         fi
     else
-        echo "$params_to_add" | sudo tee -a "$conf_file" > /dev/null
+	sudo sh -c "echo '$params_to_add' | tee -a '$conf_file' > /dev/null"
     fi
 done
