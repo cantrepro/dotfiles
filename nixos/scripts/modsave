@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dotnix"
+mkdir -p "${STATE_DIR}"
+
+lsmod > "${STATE_DIR}/modsave"
+echo "INFO: Saved module list to ${STATE_DIR}/modsave"

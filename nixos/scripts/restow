@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="${DOTNIX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+echo "INFO: Stow has been replaced by Home Manager + Flakes."
+echo "INFO: Applying NixOS configuration from ${ROOT_DIR}."
+sudo nixos-rebuild switch --flake "${ROOT_DIR}#default"
