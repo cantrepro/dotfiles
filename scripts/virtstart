@@ -1,25 +1,45 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-echo '' > /etc/libvirt/qemu/networks/default.xml
-echo '' > /etc/libvirt/qemu/networks/autostart/default.xml
+: > /etc/libvirt/qemu/networks/default.xml
+: > /etc/libvirt/qemu/networks/autostart/default.xml
 
 iptables-save > /tmp/iptables-save
 
 systemctl start libvirtd || { echo >&2 'Failed to start libvirtd.service'; exit 3; }
 systemctl start virtlogd || { echo >&2 'Failed to start virtlogd.service'; exit 4; }
 
-mac=$(printf '00:60:2F:%02X:%02X:%02X\n' $[RANDOM%256] $[RANDOM%256] $[RANDOM%256])
+mac=$(printf '00:60:2F:%02X:%02X:%02X\n' \
+  $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
 
-ip link add virbr10-dummy address ${mac} type dummy || { echo >&2 'Failed to create a dummy interface'; }
-brctl addbr virbr10 || { echo >&2 'Failed to add bridge'; }
-brctl stp virbr10 on || { echo >&2 'Failed to enable STP on bridge'; }
-brctl addif virbr10 virbr10-dummy || { echo >&2 'Failed to add the dummy interface to bridge'; }
-ip address add 192.168.23.1/24 dev virbr10 broadcast 192.168.23.255 || { echo >&2 'Failed to set IP on bridge'; }
+dummy_if="virbr10-dummy"
+bridge="virbr10"
+bridge_cidr="192.168.23.1/24"
+bridge_bcast="192.168.23.255"
 
-ip link set virbr10 up || { echo >&2 'Failed to bring the bridge up'; }
-#ip link set vnet0 up
+if ! ip link show "${dummy_if}" >/dev/null 2>&1; then
+  ip link add "${dummy_if}" address "${mac}" type dummy \
+    || { echo >&2 'Failed to create a dummy interface'; exit 5; }
+fi
+
+if ! ip link show "${bridge}" >/dev/null 2>&1; then
+  ip link add name "${bridge}" type bridge \
+    || { echo >&2 'Failed to add bridge'; exit 6; }
+fi
+
+ip link set dev "${bridge}" type bridge stp_state 1 \
+  || { echo >&2 'Failed to enable STP on bridge'; exit 7; }
+
+ip link set dev "${dummy_if}" master "${bridge}" \
+  || { echo >&2 'Failed to add the dummy interface to bridge'; exit 8; }
+
+ip addr replace "${bridge_cidr}" brd "${bridge_bcast}" dev "${bridge}" \
+  || { echo >&2 'Failed to set IP on bridge'; exit 9; }
+
+ip link set "${dummy_if}" up || { echo >&2 'Failed to bring dummy interface up'; exit 10; }
+ip link set "${bridge}" up    || { echo >&2 'Failed to bring the bridge up'; exit 11; }
 
 sleep 1
-iptables-restore /tmp/iptables-save
+iptables-restore < /tmp/iptables-save || { echo >&2 'Failed to restore iptables rules'; exit 12; }
 
 exit 0
