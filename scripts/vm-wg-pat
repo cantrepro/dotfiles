@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Route only the KVM guest subnet behind virbr10 through WireGuard.
+# This intentionally does NOT use wg-quick, because wg-quick may install
+# 0.0.0.0/0 routes in the host's main routing table.
+#
+# Usage:
+#   sudo ./vm-wg-pat up /etc/wireguard/vmwg.conf
+#   sudo ./vm-wg-pat down
+#   sudo ./vm-wg-pat status
+#
+# Expected WireGuard config: normal wg-quick style is fine, e.g.
+# [Interface]
+# Address = 10.x.y.z/32
+# PrivateKey = ...
+# DNS = ...              # ignored here; set DNS inside the VM instead
+#
+# [Peer]
+# PublicKey = ...
+# Endpoint = vpn.example.com:51820
+# AllowedIPs = 0.0.0.0/0
+# PersistentKeepalive = 25
+
+VM_BRIDGE="${VM_BRIDGE:-virbr10}"
+VM_CIDR="${VM_CIDR:-192.168.23.0/24}"
+WG_IF="${WG_IF:-wg-vm}"
+WG_TABLE="${WG_TABLE:-51823}"
+WG_RULE_PRIO="${WG_RULE_PRIO:-1000}"
+WG_CONFIG="${WG_CONFIG:-/etc/wireguard/${WG_IF}.conf}"
+FWD_CHAIN="${FWD_CHAIN:-VMWG_FORWARD}"
+V6_FWD_CHAIN="${V6_FWD_CHAIN:-VMWG6_FORWARD}"
+BLOCK_HOST_DNS="${BLOCK_HOST_DNS:-1}"
+BLOCK_VM_IPV6="${BLOCK_VM_IPV6:-1}"
+TMP_WG_CONF=""
+
+cleanup() {
+  [[ -n "${TMP_WG_CONF}" ]] && rm -f "${TMP_WG_CONF}"
+}
+trap cleanup EXIT
+
+usage() {
+  cat >&2 <<USAGE
+Usage:
+  sudo $0 up [wireguard.conf]
+  sudo $0 down
+  sudo $0 status
+
+Environment overrides:
+  VM_BRIDGE=${VM_BRIDGE}
+  VM_CIDR=${VM_CIDR}
+  WG_IF=${WG_IF}
+  WG_TABLE=${WG_TABLE}
+  WG_RULE_PRIO=${WG_RULE_PRIO}  # must be lower than the kernel main-table priority 32766
+  BLOCK_HOST_DNS=${BLOCK_HOST_DNS}
+  BLOCK_VM_IPV6=${BLOCK_VM_IPV6}
+USAGE
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo >&2 "Run as root."
+    exit 1
+  fi
+}
+
+require_cmds() {
+  local missing=0
+  for cmd in ip wg iptables sysctl awk mktemp; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+      echo >&2 "Missing required command: ${cmd}"
+      missing=1
+    fi
+  done
+  [[ "${missing}" -eq 0 ]] || exit 2
+}
+
+ipt() {
+  iptables -w "$@"
+}
+
+ipt_append_once() {
+  local table_args=()
+  if [[ "${1:-}" == "-t" ]]; then
+    table_args=(-t "$2")
+    shift 2
+  fi
+  local chain="$1"
+  shift
+  ipt "${table_args[@]}" -C "${chain}" "$@" 2>/dev/null || \
+    ipt "${table_args[@]}" -A "${chain}" "$@"
+}
+
+ipt_insert_once() {
+  local table_args=()
+  if [[ "${1:-}" == "-t" ]]; then
+    table_args=(-t "$2")
+    shift 2
+  fi
+  local chain="$1"
+  shift
+  ipt "${table_args[@]}" -C "${chain}" "$@" 2>/dev/null || \
+    ipt "${table_args[@]}" -I "${chain}" 1 "$@"
+}
+
+ipt_delete_all() {
+  local table_args=()
+  if [[ "${1:-}" == "-t" ]]; then
+    table_args=(-t "$2")
+    shift 2
+  fi
+  local chain="$1"
+  shift
+  while ipt "${table_args[@]}" -D "${chain}" "$@" 2>/dev/null; do :; done
+}
+
+ip6t() {
+  ip6tables -w "$@"
+}
+
+ip6t_insert_once() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local chain="$1"
+  shift
+  ip6t -C "${chain}" "$@" 2>/dev/null || ip6t -I "${chain}" 1 "$@"
+}
+
+ip6t_delete_all() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  local chain="$1"
+  shift
+  while ip6t -D "${chain}" "$@" 2>/dev/null; do :; done
+}
+
+wg_config_addresses() {
+  awk '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    /^[ \t]*($|#|;)/ { next }
+    {
+      eq = index($0, "=")
+      if (!eq) next
+      key = tolower(trim(substr($0, 1, eq - 1)))
+      if (key != "address") next
+      val = substr($0, eq + 1)
+      sub(/[ \t]*(#|;).*$/, "", val)
+      n = split(val, parts, ",")
+      for (i = 1; i <= n; i++) {
+        addr = trim(parts[i])
+        if (addr != "") print addr
+      }
+    }
+  ' "${WG_CONFIG}"
+}
+
+wg_config_mtu() {
+  awk '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    /^[ \t]*($|#|;)/ { next }
+    {
+      eq = index($0, "=")
+      if (!eq) next
+      key = tolower(trim(substr($0, 1, eq - 1)))
+      if (key != "mtu") next
+      val = substr($0, eq + 1)
+      sub(/[ \t]*(#|;).*$/, "", val)
+      print trim(val)
+      exit
+    }
+  ' "${WG_CONFIG}"
+}
+
+write_wg_setconf_file() {
+  local out="$1"
+  # Strip wg-quick-only keys and host-routing hook keys. wg(8) cannot parse
+  # Address/DNS/MTU/Table/PostUp/etc., and we do not want any config hook to
+  # modify the host route table or firewall.
+  awk '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    /^[ \t]*($|#|;)/ { print; next }
+    {
+      eq = index($0, "=")
+      if (eq) {
+        key = tolower(trim(substr($0, 1, eq - 1)))
+        if (key == "address" || key == "dns" || key == "mtu" ||
+            key == "table" || key == "preup" || key == "postup" ||
+            key == "predown" || key == "postdown" ||
+            key == "saveconfig" || key == "fwmark") {
+          next
+        }
+      }
+      print
+    }
+  ' "${WG_CONFIG}" > "${out}"
+}
+
+remove_policy_routing() {
+  # Remove any rule for this VM subnet/table, regardless of priority. This also
+  # cleans up older versions of this script that used priority 51823, which is
+  # after the kernel main-table rule and therefore too late for policy routing.
+  while ip -4 rule del from "${VM_CIDR}" table "${WG_TABLE}" 2>/dev/null; do :; done
+  while ip -4 rule del priority "${WG_RULE_PRIO}" from "${VM_CIDR}" table "${WG_TABLE}" 2>/dev/null; do :; done
+  ip -4 route flush table "${WG_TABLE}" >/dev/null 2>&1 || true
+}
+
+install_policy_routing() {
+  # Policy rules are evaluated in ascending priority order. The built-in
+  # main-table rule is priority 32766, so this rule must stay below 32766;
+  # otherwise the host's normal default route wins before table ${WG_TABLE} is
+  # even consulted.
+  if [[ "${WG_RULE_PRIO}" -ge 32766 ]]; then
+    echo >&2 "WG_RULE_PRIO=${WG_RULE_PRIO} is too high; use a value below 32766, e.g. 1000."
+    exit 7
+  fi
+
+  # The blackhole default prevents fall-through to the host's main table if the
+  # WireGuard route disappears while the source rule still exists.
+  ip -4 route replace blackhole default table "${WG_TABLE}" metric 32767
+  ip -4 route replace default dev "${WG_IF}" table "${WG_TABLE}" metric 100
+
+  if ! ip -4 rule show | grep -Fq "from ${VM_CIDR} lookup ${WG_TABLE}"; then
+    ip -4 rule add priority "${WG_RULE_PRIO}" from "${VM_CIDR}" table "${WG_TABLE}"
+  fi
+}
+
+remove_iptables_rules() {
+  ipt_delete_all FORWARD -i "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+  ipt_delete_all FORWARD -o "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+
+  ipt -F "${FWD_CHAIN}" 2>/dev/null || true
+  ipt -X "${FWD_CHAIN}" 2>/dev/null || true
+
+  ipt_delete_all -t nat POSTROUTING -s "${VM_CIDR}" -o "${WG_IF}" -j MASQUERADE
+  ipt_delete_all -t mangle FORWARD -s "${VM_CIDR}" -o "${WG_IF}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+  ipt_delete_all INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p udp --dport 53 -j REJECT
+  ipt_delete_all INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p tcp --dport 53 -j REJECT
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6t_delete_all FORWARD -i "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+    ip6t_delete_all FORWARD -o "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+    ip6t -F "${V6_FWD_CHAIN}" 2>/dev/null || true
+    ip6t -X "${V6_FWD_CHAIN}" 2>/dev/null || true
+  fi
+}
+
+install_iptables_rules() {
+  ipt -N "${FWD_CHAIN}" 2>/dev/null || ipt -F "${FWD_CHAIN}"
+
+  # Replies from the tunnel back to guests.
+  ipt_append_once "${FWD_CHAIN}" -i "${WG_IF}" -o "${VM_BRIDGE}" -d "${VM_CIDR}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+  # Guests may be forwarded only into the WireGuard interface.
+  ipt_append_once "${FWD_CHAIN}" -i "${VM_BRIDGE}" -s "${VM_CIDR}" -o "${WG_IF}" -j ACCEPT
+
+  # Kill switch: any other forwarded traffic from the VM bridge is blocked.
+  ipt_append_once "${FWD_CHAIN}" -i "${VM_BRIDGE}" -s "${VM_CIDR}" -j REJECT --reject-with icmp-net-unreachable
+
+  # Do not allow unsolicited traffic from the VPN side into the guests.
+  ipt_append_once "${FWD_CHAIN}" -o "${VM_BRIDGE}" -d "${VM_CIDR}" -j REJECT --reject-with icmp-port-unreachable
+
+  ipt_insert_once FORWARD -i "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+  ipt_insert_once FORWARD -o "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+
+  ipt_append_once -t nat POSTROUTING -s "${VM_CIDR}" -o "${WG_IF}" -j MASQUERADE
+  ipt_append_once -t mangle FORWARD -s "${VM_CIDR}" -o "${WG_IF}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+  # Prevent a DNS leak through a resolver running on the host/bridge address.
+  # Set DNS inside each VM to the VPN provider's DNS, or to a public resolver;
+  # those packets will be routed through ${WG_IF}.
+  if [[ "${BLOCK_HOST_DNS}" == "1" ]]; then
+    ipt_insert_once INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p udp --dport 53 -j REJECT
+    ipt_insert_once INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p tcp --dport 53 -j REJECT
+  fi
+
+  # Your current VM network is IPv4-only. Block forwarded IPv6 from/to the VM
+  # bridge so guests cannot bypass the IPv4 WireGuard routing via IPv6.
+  if [[ "${BLOCK_VM_IPV6}" == "1" ]] && command -v ip6tables >/dev/null 2>&1; then
+    ip6t -N "${V6_FWD_CHAIN}" 2>/dev/null || ip6t -F "${V6_FWD_CHAIN}"
+    ip6t -A "${V6_FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited
+    ip6t -A "${V6_FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited
+    ip6t_insert_once FORWARD -i "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+    ip6t_insert_once FORWARD -o "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+  fi
+}
+
+up() {
+  require_root
+  require_cmds
+
+  if [[ ! -r "${WG_CONFIG}" ]]; then
+    echo >&2 "WireGuard config not readable: ${WG_CONFIG}"
+    exit 3
+  fi
+
+  if ! ip link show "${VM_BRIDGE}" >/dev/null 2>&1; then
+    echo >&2 "VM bridge ${VM_BRIDGE} does not exist. Run your virtstart script first."
+    exit 4
+  fi
+
+  local mtu addr
+  TMP_WG_CONF="$(mktemp)"
+  chmod 600 "${TMP_WG_CONF}"
+
+  write_wg_setconf_file "${TMP_WG_CONF}"
+
+  if ! wg_config_addresses | grep -q .; then
+    echo >&2 "No Address= line found in ${WG_CONFIG}. Add the WireGuard interface address."
+    exit 5
+  fi
+
+  # Recreate only this WireGuard interface. Host default routes stay untouched.
+  ip link del "${WG_IF}" >/dev/null 2>&1 || true
+  ip link add "${WG_IF}" type wireguard
+  wg setconf "${WG_IF}" "${TMP_WG_CONF}"
+
+  mtu="$(wg_config_mtu || true)"
+  if [[ -n "${mtu}" ]]; then
+    ip link set mtu "${mtu}" dev "${WG_IF}"
+  else
+    ip link set mtu 1420 dev "${WG_IF}"
+  fi
+
+  while IFS= read -r addr; do
+    [[ -n "${addr}" ]] && ip address add "${addr}" dev "${WG_IF}"
+  done < <(wg_config_addresses)
+
+  ip link set "${WG_IF}" up
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.${WG_IF}.rp_filter=0" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.${VM_BRIDGE}.rp_filter=0" >/dev/null 2>&1 || true
+
+  remove_policy_routing
+  install_policy_routing
+  install_iptables_rules
+
+  echo "VM WireGuard NAT is up."
+  echo "  VM subnet: ${VM_CIDR} on ${VM_BRIDGE}"
+  echo "  VPN iface: ${WG_IF} using routing table ${WG_TABLE}"
+  echo "  Host default route was not changed."
+}
+
+down() {
+  require_root
+  require_cmds
+
+  remove_iptables_rules
+  remove_policy_routing
+  ip link del "${WG_IF}" >/dev/null 2>&1 || true
+
+  echo "VM WireGuard NAT is down."
+}
+
+status() {
+  require_root
+  require_cmds
+
+  echo "=== WireGuard ==="
+  wg show "${WG_IF}" 2>/dev/null || echo "${WG_IF} is not up"
+  echo
+  echo "=== IPv4 rule for VM subnet ==="
+  ip -4 rule show | grep -F "from ${VM_CIDR}" || true
+  echo "Kernel main-table priority is 32766; VM rule priority must be lower than that."
+  echo
+  echo "=== Routing table ${WG_TABLE} ==="
+  ip -4 route show table "${WG_TABLE}" || true
+  echo
+  echo "=== IPv4 forwarding chain ==="
+  ipt -S "${FWD_CHAIN}" 2>/dev/null || echo "${FWD_CHAIN} does not exist"
+  echo
+  echo "=== NAT rule ==="
+  ipt -t nat -S POSTROUTING | grep -F -- "-s ${VM_CIDR}" | grep -F -- "-o ${WG_IF}" || true
+}
+
+main() {
+  local action="${1:-}"
+  case "${action}" in
+    up|start|enable)
+      [[ $# -ge 2 ]] && WG_CONFIG="$2"
+      up
+      ;;
+    down|stop|disable)
+      down
+      ;;
+    status)
+      status
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      usage
+      exit 64
+      ;;
+  esac
+}
+
+main "$@"

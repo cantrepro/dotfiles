@@ -19,7 +19,6 @@ iwd
 man
 ranger
 highlight
-cronie
 aria2
 
 dnsutils
@@ -56,10 +55,7 @@ xcalib
 audit
 apparmor
 firejail
-rkhunter
 
-lynx
-qutebrowser
 firefox
 
 qemu
