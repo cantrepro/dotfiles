@@ -217,6 +217,12 @@ install_policy_routing() {
   ip -4 route replace blackhole default table "${WG_TABLE}" metric 32767
   ip -4 route replace default dev "${WG_IF}" table "${WG_TABLE}" metric 100
 
+  # The source rule below also matches packets sent by the host from its bridge
+  # address (for example, 192.168.23.1). Keep the directly connected VM subnet
+  # in this table so host replies and host-initiated traffic go back through the
+  # bridge instead of being swallowed by the WireGuard default route.
+  ip -4 route replace "${VM_CIDR}" dev "${VM_BRIDGE}" table "${WG_TABLE}" scope link
+
   if ! ip -4 rule show | grep -Fq "from ${VM_CIDR} lookup ${WG_TABLE}"; then
     ip -4 rule add priority "${WG_RULE_PRIO}" from "${VM_CIDR}" table "${WG_TABLE}"
   fi
@@ -339,6 +345,7 @@ up() {
   echo "VM WireGuard NAT is up."
   echo "  VM subnet: ${VM_CIDR} on ${VM_BRIDGE}"
   echo "  VPN iface: ${WG_IF} using routing table ${WG_TABLE}"
+  echo "  Host/VM traffic on ${VM_CIDR} stays on ${VM_BRIDGE}."
   echo "  Host default route was not changed."
 }
 
