@@ -30,6 +30,8 @@ netcat
 dhcpcd
 openssh
 resolvconf
+wireless_tools
+wireguard-tools
 
 pulseaudio
 pulsemixer

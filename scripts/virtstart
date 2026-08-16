@@ -1,45 +1,202 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: > /etc/libvirt/qemu/networks/default.xml
-: > /etc/libvirt/qemu/networks/autostart/default.xml
+# Create/prepare the custom KVM bridge used by vm-wg-pat.
+#
+# This script deliberately does NOT:
+#   - iptables-save
+#   - iptables-restore
+#   - modify the host's global firewall rules
+#
+# vm-wg-pat owns the WireGuard-specific firewall/routing state.
 
-iptables-save > /tmp/iptables-save
+LIBVIRT_SERVICE="${LIBVIRT_SERVICE:-libvirtd}"
+VIRTLOGD_SERVICE="${VIRTLOGD_SERVICE:-virtlogd}"
 
-systemctl start libvirtd || { echo >&2 'Failed to start libvirtd.service'; exit 3; }
-systemctl start virtlogd || { echo >&2 'Failed to start virtlogd.service'; exit 4; }
+DUMMY_IF="${DUMMY_IF:-virbr10-dummy}"
+BRIDGE="${BRIDGE:-virbr10}"
 
-mac=$(printf '00:60:2F:%02X:%02X:%02X\n' \
-  $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
+BRIDGE_CIDR="${BRIDGE_CIDR:-192.168.23.1/24}"
+BRIDGE_BCAST="${BRIDGE_BCAST:-192.168.23.255}"
 
-dummy_if="virbr10-dummy"
-bridge="virbr10"
-bridge_cidr="192.168.23.1/24"
-bridge_bcast="192.168.23.255"
+STP_STATE="${STP_STATE:-1}"
 
-if ! ip link show "${dummy_if}" >/dev/null 2>&1; then
-  ip link add "${dummy_if}" address "${mac}" type dummy \
-    || { echo >&2 'Failed to create a dummy interface'; exit 5; }
-fi
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        echo >&2 "Run as root."
+        exit 1
+    fi
+}
 
-if ! ip link show "${bridge}" >/dev/null 2>&1; then
-  ip link add name "${bridge}" type bridge \
-    || { echo >&2 'Failed to add bridge'; exit 6; }
-fi
 
-ip link set dev "${bridge}" type bridge stp_state 1 \
-  || { echo >&2 'Failed to enable STP on bridge'; exit 7; }
+require_cmds() {
+    local missing=0
 
-ip link set dev "${dummy_if}" master "${bridge}" \
-  || { echo >&2 'Failed to add the dummy interface to bridge'; exit 8; }
+    for cmd in ip systemctl; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo >&2 "Missing required command: ${cmd}"
+            missing=1
+        fi
+    done
 
-ip addr replace "${bridge_cidr}" brd "${bridge_bcast}" dev "${bridge}" \
-  || { echo >&2 'Failed to set IP on bridge'; exit 9; }
+    [[ "${missing}" -eq 0 ]] || exit 2
+}
 
-ip link set "${dummy_if}" up || { echo >&2 'Failed to bring dummy interface up'; exit 10; }
-ip link set "${bridge}" up    || { echo >&2 'Failed to bring the bridge up'; exit 11; }
 
-sleep 1
-iptables-restore < /tmp/iptables-save || { echo >&2 'Failed to restore iptables rules'; exit 12; }
+die() {
+    echo >&2 "ERROR: $*"
+    exit 1
+}
 
-exit 0
+
+random_mac() {
+    printf '00:60:2F:%02X:%02X:%02X\n' \
+        "$((RANDOM % 256))" \
+        "$((RANDOM % 256))" \
+        "$((RANDOM % 256))"
+}
+
+
+ensure_service() {
+    local service="$1"
+
+    if systemctl start "${service}"; then
+        echo "OK: ${service} is running."
+    else
+        die "Failed to start ${service}."
+    fi
+}
+
+
+ensure_dummy() {
+    if ip link show "${DUMMY_IF}" >/dev/null 2>&1; then
+        echo "OK: dummy interface ${DUMMY_IF} exists."
+        return
+    fi
+
+    local mac
+    mac="$(random_mac)"
+
+    ip link add \
+        "${DUMMY_IF}" \
+        address "${mac}" \
+        type dummy
+
+    echo "Created dummy interface ${DUMMY_IF} (${mac})."
+}
+
+
+ensure_bridge() {
+    if ip link show "${BRIDGE}" >/dev/null 2>&1; then
+        echo "OK: bridge ${BRIDGE} exists."
+    else
+        ip link add \
+            name "${BRIDGE}" \
+            type bridge
+
+        echo "Created bridge ${BRIDGE}."
+    fi
+
+    ip link set \
+        dev "${BRIDGE}" \
+        type bridge \
+        stp_state "${STP_STATE}"
+
+    echo "OK: STP state = ${STP_STATE}."
+}
+
+
+attach_dummy() {
+    local master
+
+    master="$(
+        ip -o link show dev "${DUMMY_IF}" |
+            sed -n 's/.* master \([^ ]*\).*/\1/p'
+    )"
+
+    if [[ "${master}" == "${BRIDGE}" ]]; then
+        echo "OK: ${DUMMY_IF} already belongs to ${BRIDGE}."
+        return
+    fi
+
+    # If it belongs to another bridge, detach it first.
+    if [[ -n "${master}" ]]; then
+        ip link set dev "${DUMMY_IF}" nomaster
+    fi
+
+    ip link set \
+        dev "${DUMMY_IF}" \
+        master "${BRIDGE}"
+
+    echo "OK: attached ${DUMMY_IF} -> ${BRIDGE}."
+}
+
+
+configure_bridge_address() {
+    ip addr replace \
+        "${BRIDGE_CIDR}" \
+        brd "${BRIDGE_BCAST}" \
+        dev "${BRIDGE}"
+
+    echo "OK: ${BRIDGE} = ${BRIDGE_CIDR}."
+}
+
+
+bring_up() {
+    ip link set "${DUMMY_IF}" up
+    ip link set "${BRIDGE}" up
+
+    echo "OK: ${DUMMY_IF} is UP."
+    echo "OK: ${BRIDGE} is UP."
+}
+
+
+verify() {
+    echo
+    echo "========================================"
+    echo " virtstart verification"
+    echo "========================================"
+    echo
+
+    ip -br link show "${DUMMY_IF}"
+    ip -br addr show "${BRIDGE}"
+
+    echo
+    echo "Bridge members:"
+    ip -o link show master "${BRIDGE}" 2>/dev/null || true
+
+    echo
+    echo "Bridge state:"
+    ip -d link show "${BRIDGE}" |
+        sed -n '1,8p'
+
+    echo
+    echo "Routing:"
+    ip -4 route show dev "${BRIDGE}" || true
+
+    echo
+    echo "Result:"
+    echo "  bridge: ${BRIDGE}"
+    echo "  subnet: ${BRIDGE_CIDR}"
+    echo "  dummy:  ${DUMMY_IF}"
+    echo
+}
+
+
+main() {
+    require_root
+    require_cmds
+
+    ensure_service "${LIBVIRT_SERVICE}"
+    ensure_service "${VIRTLOGD_SERVICE}"
+
+    ensure_dummy
+    ensure_bridge
+    attach_dummy
+    configure_bridge_address
+    bring_up
+    verify
+}
+
+
+main "$@"

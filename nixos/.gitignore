@@ -1,4 +1,0 @@
-configs/qutebrowser/.config/qutebrowser/bookmarks/
-configs/qutebrowser/.config/qutebrowser/quickmarks
-hosts/default/host-vars.nix
-hosts/default/hardware-configuration.nix

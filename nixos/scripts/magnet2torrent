@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-
-aria2c -d ./ --bt-metadata-only=true --bt-save-metadata=true --listen-port=6881 `cat torrent.magnet`
