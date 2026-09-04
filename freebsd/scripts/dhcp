@@ -1,0 +1,17 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+interface=${1:-wlan0}
+if ! ifconfig "$interface" >/dev/null 2>&1; then
+  echo >&2 "Unknown interface: $interface"
+  exit 1
+fi
+
+service netif restart "$interface"

@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  echo >&2 "usage: ${0##*/} PORT SOURCE_CIDR"
+  exit 64
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$script_dir/pf-anchor" delete "open-tcp-$1-$2"

@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  echo >&2 "usage: ${0##*/} PORT SOURCE_CIDR"
+  echo >&2 "example: ${0##*/} 8000 192.168.66.0/24"
+  exit 64
+fi
+
+port=$1
+source_net=$2
+
+case "$port" in ''|*[!0-9]*) exit 64 ;; esac
+if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then exit 64; fi
+case "$source_net" in *[!0-9./]*|'') exit 64 ;; esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$script_dir/pf-anchor" add "open-udp-$port-$source_net" \
+  "pass in quick inet proto udp from $source_net to self port $port keep state"

@@ -1,0 +1,33 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+source_pf="$script_dir/../static/pf.conf"
+source_anchor="$script_dir/../static/pf.anchors/dotfiles.conf"
+target_anchor=/etc/pf.anchors/dotfiles.conf
+
+mkdir -p /etc/pf.anchors
+if [ ! -e "$target_anchor" ]; then
+  install -m 0600 "$source_anchor" "$target_anchor"
+fi
+
+pfctl -vnf "$target_anchor" >/dev/null
+pfctl -vnf "$source_pf" >/dev/null
+backup_and_install "$source_pf" /etc/pf.conf 0600
+
+sysrc pf_enable=YES
+sysrc pf_rules=/etc/pf.conf
+
+if pfctl -s info >/dev/null 2>&1; then
+  service pf reload
+else
+  service pf start
+fi
+
+echo "PF enabled. Add inbound exceptions with opentcp/openudp."

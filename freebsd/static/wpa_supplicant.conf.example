@@ -1,0 +1,9 @@
+# Copy to /etc/wpa_supplicant.conf, replace the placeholders, then configure
+# wlans_<device> and ifconfig_wlan0="WPA SYNCDHCP" in /etc/rc.conf.
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+
+network={
+    ssid="your-ssid"
+    psk="your-passphrase"
+}

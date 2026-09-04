@@ -1,0 +1,31 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$(uname -s)" != "FreeBSD" ]; then
+  echo >&2 "This installer is for FreeBSD."
+  exit 1
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+package_file=${1:-"${script_dir}/../static/freebsd_packages"}
+
+if [ ! -r "$package_file" ]; then
+  echo >&2 "Package list not found: $package_file"
+  exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+  sudo_cmd=
+else
+  command -v sudo >/dev/null 2>&1 || {
+    echo >&2 "Install security/sudo first or run this script as root."
+    exit 1
+  }
+  sudo_cmd=sudo
+fi
+
+packages=$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$package_file")
+
+# shellcheck disable=SC2086
+$sudo_cmd pkg install -y $packages

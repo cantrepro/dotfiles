@@ -1,0 +1,36 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+  echo >&2 "usage: ${0##*/} enable|disable EXTERNAL_IF INTERNAL_IF SOURCE_CIDR"
+  echo >&2 "example: ${0##*/} enable em0 vm-public 192.168.23.0/24"
+  exit 64
+}
+
+[ "$#" -eq 4 ] || usage
+action=$1
+external_if=$2
+internal_if=$3
+source_net=$4
+
+case "$action" in enable|disable) ;; *) usage ;; esac
+case "$external_if" in *[!A-Za-z0-9_.:-]*|'') usage ;; esac
+case "$internal_if" in *[!A-Za-z0-9_.:-]*|'') usage ;; esac
+case "$source_net" in *[!0-9./]*|'') usage ;; esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+rule_id="pat-$external_if-$internal_if-$source_net"
+
+if [ "$action" = enable ]; then
+  "$script_dir/enablefwd4"
+  "$script_dir/pf-anchor" add "$rule_id-nat" \
+    "nat on $external_if inet from $source_net to any -> ($external_if)"
+  "$script_dir/pf-anchor" add "$rule_id-pass" \
+    "pass in quick on $internal_if inet from $source_net to any keep state"
+  echo "PAT enabled for $source_net via $external_if."
+else
+  "$script_dir/pf-anchor" delete "$rule_id-nat"
+  "$script_dir/pf-anchor" delete "$rule_id-pass"
+  echo "PAT removed for $source_net."
+fi

@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+if ! sysctl -n hw.acpi.lid_switch_state >/dev/null 2>&1; then
+  echo "INFO: this machine does not expose hw.acpi.lid_switch_state."
+  exit 0
+fi
+
+set_sysctl_persistent hw.acpi.lid_switch_state NONE

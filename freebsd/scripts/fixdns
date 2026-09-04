@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+backup_and_install "$script_dir/../static/resolvconf.conf" /etc/resolvconf.conf
+resolvconf -u

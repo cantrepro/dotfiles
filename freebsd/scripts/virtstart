@@ -1,0 +1,74 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+command -v vm >/dev/null 2>&1 || {
+  echo >&2 "vm-bhyve is required (pkg install vm-bhyve)."
+  exit 1
+}
+
+vm_dir=${VM_DIR:-/vm}
+vm_switch=${VM_SWITCH:-public}
+switch_cidr=${VM_SWITCH_CIDR:-192.168.23.1/24}
+vm_network=${VM_NETWORK:-192.168.23.0/24}
+
+case "$vm_dir" in
+  zfs:*)
+    dataset=${vm_dir#zfs:}
+    mountpoint=$(zfs get -H -o value mountpoint "$dataset")
+    case "$mountpoint" in legacy|none|-)
+      echo >&2 "The ZFS vm dataset needs a mounted filesystem."
+      exit 1
+      ;;
+    esac
+    ;;
+  *)
+    mkdir -p "$vm_dir"
+    mountpoint=$vm_dir
+    ;;
+esac
+
+sysrc vm_enable=YES
+sysrc "vm_dir=$vm_dir"
+vm init
+
+template_dir="$mountpoint/.templates"
+mkdir -p "$template_dir"
+if ! find "$template_dir" -type f -name '*.conf' | grep -q .; then
+  if [ ! -d /usr/local/share/examples/vm-bhyve ]; then
+    echo >&2 "vm-bhyve example templates are not installed."
+    exit 1
+  fi
+  cp /usr/local/share/examples/vm-bhyve/*.conf "$template_dir/"
+fi
+
+switch_row=$(vm switch list | awk -v wanted="$vm_switch" 'NR > 1 && $1 == wanted { print; exit }')
+if [ -n "$switch_row" ]; then
+  current_cidr=$(printf '%s\n' "$switch_row" | awk '{ print $4 }')
+  if [ "$current_cidr" = - ]; then
+    vm switch address "$vm_switch" "$switch_cidr"
+  elif [ "$current_cidr" != "$switch_cidr" ]; then
+    echo "INFO: existing switch $vm_switch has $current_cidr; leaving it unchanged."
+    switch_cidr=$current_cidr
+  fi
+else
+  vm switch create -a "$switch_cidr" "$vm_switch"
+fi
+
+bridge_if=$(vm switch list | awk -v wanted="$vm_switch" 'NR > 1 && $1 == wanted { print $3; exit }')
+if [ -z "$bridge_if" ] || [ "$bridge_if" = - ]; then
+  echo >&2 "Could not resolve the interface for switch $vm_switch."
+  exit 1
+fi
+
+echo "vm-bhyve is initialized."
+echo "  storage: $vm_dir"
+echo "  switch:  $vm_switch ($bridge_if, $switch_cidr)"
+echo "For guest Internet access, run:"
+echo "  patinit enable <external-if> $bridge_if $vm_network"

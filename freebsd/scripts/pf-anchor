@@ -1,0 +1,58 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+anchor_file=${PF_ANCHOR_FILE:-/etc/pf.anchors/dotfiles.conf}
+action=${1:-}
+rule_id=${2:-}
+rule=${3:-}
+
+case "$rule_id" in
+  ''|*[!A-Za-z0-9._:/-]*)
+    echo >&2 "Invalid rule identifier: $rule_id"
+    exit 64
+    ;;
+esac
+
+case "$action" in
+  add)
+    if [ -z "$rule" ] || printf '%s' "$rule" | grep -q '[[:cntrl:]]'; then
+      echo >&2 "A single-line PF rule is required."
+      exit 64
+    fi
+    ;;
+  delete)
+    ;;
+  *)
+    echo >&2 "Usage: pf-anchor add RULE_ID RULE | delete RULE_ID"
+    exit 64
+    ;;
+esac
+
+mkdir -p "$(dirname "$anchor_file")"
+temp_file=$(mktemp /tmp/dotfiles-pf-anchor.XXXXXX)
+trap 'rm -f "$temp_file"' EXIT HUP INT TERM
+
+if [ -f "$anchor_file" ]; then
+  awk -v marker="# dotfiles:$rule_id" 'index($0, marker) == 0' \
+    "$anchor_file" > "$temp_file"
+fi
+
+if [ "$action" = add ]; then
+  printf '%s # dotfiles:%s\n' "$rule" "$rule_id" >> "$temp_file"
+fi
+
+pfctl -vnf "$temp_file" >/dev/null
+install -m 0600 "$temp_file" "$anchor_file"
+
+if pfctl -s info >/dev/null 2>&1; then
+  pfctl -a dotfiles -f "$anchor_file"
+else
+  echo "INFO: PF is not enabled; the rule will load when PF starts."
+fi

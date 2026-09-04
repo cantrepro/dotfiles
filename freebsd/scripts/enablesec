@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+sysrc auditd_enable=YES
+service auditd onestart || service auditd restart
+
+set_sysctl_persistent security.bsd.see_other_uids 0
+set_sysctl_persistent security.bsd.see_other_gids 0
+set_sysctl_persistent security.bsd.unprivileged_proc_debug 0

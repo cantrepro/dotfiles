@@ -1,0 +1,14 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+target_dir=/usr/local/etc/X11/xorg.conf.d
+mkdir -p "$target_dir"
+backup_and_install "$script_dir/../static/30-touchpad.conf" "$target_dir/30-touchpad.conf"
+echo "Touchpad settings will take effect the next time Xorg starts."

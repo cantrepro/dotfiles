@@ -1,0 +1,12 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+sysrc gateway_enable=YES
+sysctl net.inet.ip.forwarding=1

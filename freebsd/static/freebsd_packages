@@ -1,0 +1,66 @@
+# Shell and userland
+sudo
+bash
+bash-completion
+neovim
+stow
+btop
+tree
+lsof
+ripgrep
+git
+curl
+wget
+zip
+unzip
+7-zip
+unrar
+#ranger
+highlight
+aria2
+gnupg
+
+# Network tools
+bind-tools
+nmap
+wireguard-tools
+wireshark
+
+# Audio
+pulseaudio
+#pulsemixer
+
+# X11 desktop
+xorg
+dbus
+rxvt-unicode
+lxqt-policykit
+i3
+i3status
+dmenu
+slock
+dunst
+picom
+scrot
+clipmenu
+parcellite
+xdotool
+alacritty
+xclip
+xcalib
+xf86-input-libinput
+adwaita-icon-theme
+
+# Applications used by the configs and scripts
+firefox
+zathura
+zathura-pdf-mupdf
+tesseract
+obs-studio
+spice-gtk
+
+# Native virtualization
+vm-bhyve
+bhyve-firmware
+grub2-bhyve
+tmux

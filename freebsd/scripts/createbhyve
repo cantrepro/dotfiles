@@ -1,0 +1,40 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib/freebsd.sh"
+
+require_freebsd
+require_root
+
+usage() {
+  echo >&2 "usage: ${0##*/} NAME [TEMPLATE] [DISK_SIZE] [INSTALL_ISO]"
+  echo >&2 "example: ${0##*/} freebsd-test default 50G FreeBSD.iso"
+  exit 64
+}
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then usage; fi
+
+name=$1
+template=${2:-default}
+disk_size=${3:-50G}
+install_iso=${4:-}
+
+case "$name" in *[!A-Za-z0-9_.-]*|'') usage ;; esac
+case "$template" in *[!A-Za-z0-9_.-]*|'') usage ;; esac
+case "$disk_size" in *[!A-Za-z0-9.]*|'') usage ;; esac
+
+command -v vm >/dev/null 2>&1 || {
+  echo >&2 "vm-bhyve is required (pkg install vm-bhyve)."
+  exit 1
+}
+
+vm create -t "$template" -s "$disk_size" "$name"
+
+if [ -n "$install_iso" ]; then
+  vm install "$name" "$install_iso"
+  echo "Installer started. Attach with: vm console $name"
+else
+  echo "Created $name. Install with: vm install $name <iso>"
+fi

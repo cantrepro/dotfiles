@@ -1,0 +1,10 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+state_dir="${script_dir}/../state"
+
+mkdir -p "$state_dir"
+kldstat > "$state_dir/modsave"
+echo "Saved loaded kernel modules to $state_dir/modsave"

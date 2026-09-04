@@ -1,0 +1,41 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+  echo >&2 "usage: ${0##*/} enable|disable WAN_IF HOST_IP HOST_PORT VM_IP VM_PORT [SOURCE]"
+  echo >&2 "example: ${0##*/} enable em0 192.168.1.149 8080 192.168.23.2 8080"
+  exit 64
+}
+
+if [ "$#" -lt 6 ] || [ "$#" -gt 7 ]; then usage; fi
+action=$1
+wan_if=$2
+host_ip=$3
+host_port=$4
+vm_ip=$5
+vm_port=$6
+source_net=${7:-any}
+
+case "$action" in enable|disable) ;; *) usage ;; esac
+case "$wan_if" in *[!A-Za-z0-9_.:-]*|'') usage ;; esac
+case "$host_ip" in *[!0-9.]*|'') usage ;; esac
+case "$vm_ip" in *[!0-9.]*|'') usage ;; esac
+case "$source_net" in any) ;; *[!0-9./]*|'') usage ;; esac
+case "$host_port" in *[!0-9]*|'') usage ;; esac
+case "$vm_port" in *[!0-9]*|'') usage ;; esac
+if [ "$host_port" -lt 1 ] || [ "$host_port" -gt 65535 ]; then usage; fi
+if [ "$vm_port" -lt 1 ] || [ "$vm_port" -gt 65535 ]; then usage; fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+rule_id="rdr-$wan_if-$host_ip-$host_port-$vm_ip-$vm_port-$source_net"
+
+if [ "$action" = enable ]; then
+  "$script_dir/enablefwd4"
+  "$script_dir/pf-anchor" add "$rule_id" \
+    "rdr pass on $wan_if inet proto tcp from $source_net to $host_ip port $host_port -> $vm_ip port $vm_port"
+  echo "Forward enabled: $host_ip:$host_port -> $vm_ip:$vm_port"
+else
+  "$script_dir/pf-anchor" delete "$rule_id"
+  echo "Forward removed: $host_ip:$host_port -> $vm_ip:$vm_port"
+fi

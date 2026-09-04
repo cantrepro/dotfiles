@@ -1,0 +1,27 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+config_dir="${script_dir}/../configs"
+
+command -v stow >/dev/null 2>&1 || {
+  echo >&2 "GNU Stow is required (pkg install stow)."
+  exit 1
+}
+
+cd "$config_dir"
+
+if [ "$#" -eq 0 ]; then
+  set -- */
+fi
+
+for package in "$@"; do
+  package=${package%/}
+  if [ ! -d "$package" ]; then
+    echo >&2 "Unknown config package: $package"
+    exit 1
+  fi
+  echo "Restowing $package"
+  stow --restow --target="$HOME" "$package"
+done
