@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# VM-only OpenVPN over AirVPN's stunnel/SSL transport.
+# Keep vm-ovpn-pat alongside this script: it supplies the shared VM gateway.
+# The original .ovpn, .ssl and certificate files are never modified.
+#
+# Usage:
+#   sudo ./vm-ovpnssl-pat up
+#   sudo ./vm-ovpnssl-pat up /path/to/ssl-airvpn
+#   sudo ./vm-ovpnssl-pat up client.ovpn [client.ssl]
+#   sudo ./vm-ovpnssl-pat down|status|check|repair|watch|trace|mtu-test|dump
+#   sudo ./vm-ovpnssl-pat debug on|off
+#
+# up defaults to the single .ovpn/.ssl pair in ssl-airvpn beside this script.
+# stunnel is supervised independently; repair/watch restart both transports.
+# A startup failure retains the VM firewall and blackhole policy. An explicit
+# down removes them and restores ordinary forwarding, as in vm-ovpn-pat.
+
+SSL_SCRIPT="$(realpath -e -- "${BASH_SOURCE[0]}")"
+SSL_SCRIPT_DIR="$(dirname -- "${SSL_SCRIPT}")"
+SSL_BASE_SCRIPT="${VM_OVPNSSL_BASE_SCRIPT:-${SSL_SCRIPT_DIR}/vm-ovpn-pat}"
+[[ -r "${SSL_BASE_SCRIPT}" ]] || { echo >&2 "Missing shared gateway script: ${SSL_BASE_SCRIPT}"; exit 1; }
+
+SSL_PROFILE_DIR="${VM_OVPNSSL_PROFILE_DIR:-${SSL_SCRIPT_DIR}/ssl-airvpn}"
+OVPN_CONFIG="${OVPN_CONFIG:-${SSL_PROFILE_DIR}}"
+SSL_CONFIG="${SSL_CONFIG:-}"
+SSL_BIN="${STUNNEL_BIN:-}"
+SSL_LOCAL_PORT=""
+SSL_REMOTE=""
+SSL_START_TIMEOUT="${VM_OVPNSSL_START_TIMEOUT:-10}"
+
+# Use separate ownership/state from the ordinary OpenVPN/WireGuard gateways.
+OVPN_IF="${OVPN_IF:-tun-vmssl}"
+OVPN_TABLE="${OVPN_TABLE:-51825}"
+OVPN_RULE_PRIO="${OVPN_RULE_PRIO:-1002}"
+FWD_CHAIN="${FWD_CHAIN:-VMOVPNSSL_FORWARD}"
+V6_FWD_CHAIN="${V6_FWD_CHAIN:-VMOVPNSSL6_FORWARD}"
+VM_OVPN_RUN_DIR="${VM_OVPNSSL_RUN_DIR:-${VM_OVPN_RUN_DIR:-/run/vm-ovpnssl-pat}}"
+source "${SSL_BASE_SCRIPT}"
+
+# Save the functions we extend without copying the gateway implementation.
+ssl_save_function() {
+    local definition
+    definition="$(declare -f "$1")"
+    eval "${definition/#$1 /$2 }"
+}
+for ssl_function in usage require_cmds load_settings save_settings status check_endpoint check trace debug dump; do
+    ssl_save_function "${ssl_function}" "gateway_${ssl_function}"
+done
+ssl_save_function up gateway_up
+ssl_save_function down gateway_down
+unset ssl_function
+
+usage() {
+    cat <<USAGE
+Usage:
+  sudo $0 up
+  sudo $0 up /path/to/ssl-airvpn
+  sudo $0 up client.ovpn [client.ssl]
+  sudo $0 down|status|check|repair|watch|trace|mtu-test|dump
+  sudo $0 debug on|off
+
+Defaults:
+  Profile directory: ${SSL_PROFILE_DIR}
+  VM bridge/subnet:  ${VM_BRIDGE} / ${VM_CIDR}
+  VPN interface:     ${OVPN_IF}
+  Policy table:      ${OVPN_TABLE}
+  Runtime directory: ${RUN_DIR}
+
+Additional environment overrides:
+  VM_OVPNSSL_PROFILE_DIR   Directory containing one .ovpn/.ssl profile pair.
+  OVPN_CONFIG             Explicit OpenVPN SSL profile.
+  SSL_CONFIG              Explicit matching stunnel profile.
+  STUNNEL_BIN             stunnel executable (stunnel/stunnel4 autodetected).
+  VM_OVPNSSL_RUN_DIR       Runtime directory, default /run/vm-ovpnssl-pat.
+  VM_OVPNSSL_START_TIMEOUT Listener startup timeout, default 10 seconds.
+
+VM_BRIDGE, VM_CIDR, OVPN_IF, OVPN_TABLE, OVPN_RULE_PRIO and the VM_OVPN_*
+health-check/watch options from vm-ovpn-pat are also supported.
+
+Requires stunnel and the adjacent vm-ovpn-pat script. up discovers the supplied
+AirVPN SSL profile automatically, preserves certificate verification, and
+starts stunnel before OpenVPN. repair/watch restart both processes. Configure
+DNS inside the VM. Stop any other VPN gateway for this VM subnet before up.
+USAGE
+}
+
+require_cmds() {
+    gateway_require_cmds || return
+    if [[ -n "${SSL_BIN}" ]]; then
+        SSL_BIN="$(command -v -- "${SSL_BIN}")" || { die "stunnel executable not found: ${STUNNEL_BIN:-${SSL_BIN}}"; return 1; }
+    elif command -v stunnel >/dev/null 2>&1; then
+        SSL_BIN="$(command -v stunnel)"
+    elif command -v stunnel4 >/dev/null 2>&1; then
+        SSL_BIN="$(command -v stunnel4)"
+    else
+        die "stunnel is required. Install your distribution's stunnel package."
+        return 1
+    fi
+    SSL_BIN="$(realpath -e -- "${SSL_BIN}")"
+    command -v nohup >/dev/null 2>&1 || die "Missing required command: nohup" || return
+}
+
+load_settings() {
+    gateway_load_settings
+    local key value
+    [[ -r "${RUN_DIR}/settings" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            SSL_CONFIG|SSL_LOCAL_PORT|SSL_REMOTE|SSL_BIN) printf -v "${key}" '%s' "${value}" ;;
+        esac
+    done < "${RUN_DIR}/settings"
+}
+
+save_settings() {
+    gateway_save_settings
+    local key
+    for key in SSL_CONFIG SSL_LOCAL_PORT SSL_REMOTE SSL_BIN; do
+        printf '%s=%s\n' "${key}" "${!key}"
+    done >> "${RUN_DIR}/settings"
+}
+
+select_profiles() {
+    local -a profiles
+    if [[ -d "${OVPN_CONFIG}" ]]; then
+        profiles=("${OVPN_CONFIG}"/*.ovpn)
+        [[ ${#profiles[@]} == 1 && -f "${profiles[0]}" ]] ||
+            die "Expected one .ovpn in ${OVPN_CONFIG}; pass the desired profile explicitly." || return
+        OVPN_CONFIG="${profiles[0]}"
+    fi
+    [[ -r "${OVPN_CONFIG}" ]] || die "OpenVPN SSL profile not readable: ${OVPN_CONFIG}" || return
+    OVPN_CONFIG="$(realpath -e -- "${OVPN_CONFIG}")"
+    if [[ -z "${SSL_CONFIG}" ]]; then SSL_CONFIG="${OVPN_CONFIG%.ovpn}.ssl"; fi
+    [[ -r "${SSL_CONFIG}" ]] || die "Matching stunnel profile not readable: ${SSL_CONFIG}" || return
+    SSL_CONFIG="$(realpath -e -- "${SSL_CONFIG}")"
+    [[ "${OVPN_CONFIG}${SSL_CONFIG}" != *$'\n'* && "${OVPN_CONFIG}${SSL_CONFIG}" != *$'\r'* ]] ||
+        die "Newlines are not supported in profile paths." || return
+}
+
+ssl_value() {
+    awk -v wanted="$1" '
+        function trim(s) {gsub(/^[ \t]+|[ \t]+$/, "", s); return s}
+        {sub(/\r$/, "")}
+        /^[ \t]*($|#|;)/ {next}
+        {eq=index($0, "="); if (eq && tolower(trim(substr($0,1,eq-1))) == wanted) print trim(substr($0,eq+1))}
+    ' "${SSL_CONFIG}"
+}
+
+validate_ssl_pair() {
+    local listener host port profile_remote profile_proto key value filename
+    [[ "${SSL_START_TIMEOUT}" =~ ^[1-9][0-9]{0,3}$ ]] || die "VM_OVPNSSL_START_TIMEOUT must be a positive integer." || return
+    # One AirVPN client service keeps listener ownership and endpoint checks exact.
+    awk '
+        function trim(s) {gsub(/^[ \t]+|[ \t]+$/, "", s); return s}
+        function fail(message) {print "Unsupported stunnel profile: " message > "/dev/stderr"; bad=1; exit 1}
+        {sub(/\r$/, ""); line=trim($0)}
+        line ~ /^($|#|;)/ {next}
+        line ~ /^\[/ {if (line != "[openvpn]" || ++sections != 1) fail("expected one [openvpn] service"); next}
+        {
+            eq=index(line,"="); if (!eq) fail("expected key = value at line " NR)
+            key=tolower(trim(substr(line,1,eq-1))); value=trim(substr(line,eq+1))
+            if (key ~ /^(include|config|exec|execargs|chroot|setenv|setuid|setgid)$/) fail(key " is unsupported")
+            if (key == "client") {if (tolower(value) != "yes") fail("client must be yes"); clients++}
+            if (key == "accept") accepts++
+            if (key == "connect") connects++
+        }
+        END {if (!bad && (sections != 1 || clients < 1 || accepts != 1 || connects != 1)) {print "Expected a client stunnel profile with one accept/connect pair" > "/dev/stderr"; exit 1}}
+    ' "${SSL_CONFIG}" || return
+    listener="$(ssl_value accept)"
+    [[ "${listener}" =~ ^(127\.0\.0\.1|localhost):([0-9]{1,5})$ ]] ||
+        die "stunnel accept must bind to 127.0.0.1 or localhost, with an explicit port." || return
+    SSL_LOCAL_PORT="$((10#${BASH_REMATCH[2]}))"
+    (( SSL_LOCAL_PORT > 0 && SSL_LOCAL_PORT <= 65535 )) || die "Invalid stunnel listener port." || return
+    SSL_REMOTE="$(ssl_value connect)"
+    [[ "${SSL_REMOTE}" =~ ^(\[[0-9a-fA-F:]+\]|[a-zA-Z0-9_.-]+):([0-9]{1,5})$ ]] ||
+        die "stunnel connect must be a host:port endpoint." || return
+    port="$((10#${BASH_REMATCH[2]}))"
+    (( port > 0 && port <= 65535 )) || die "Invalid remote stunnel port." || return
+    # Validate the OpenVPN transport outside opaque certificate/key blocks.
+    profile_remote="$(awk '
+        {sub(/\r$/, "")}
+        /^[ \t]*</ {inline = $0 !~ /^[ \t]*<\//; next}
+        inline || /^[ \t]*($|#|;)/ {next}
+        $1 == "remote" || $1 == "--remote" {print $2 ":" $3}
+    ' "${OVPN_CONFIG}")"
+    profile_proto="$(awk '
+        {sub(/\r$/, "")}
+        /^[ \t]*</ {inline = $0 !~ /^[ \t]*<\//; next}
+        inline || /^[ \t]*($|#|;)/ {next}
+        $1 == "proto" || $1 == "--proto" {print $2}
+    ' "${OVPN_CONFIG}")"
+    [[ "${profile_remote}" =~ ^(127\.0\.0\.1|localhost):([0-9]{1,5})$ ]] ||
+        die "The SSL .ovpn must have one loopback remote matching stunnel's listener." || return
+    (( 10#${BASH_REMATCH[2]} == SSL_LOCAL_PORT )) || die "OpenVPN remote port does not match stunnel accept." || return
+    case "${profile_proto}" in
+        tcp|tcp-client|tcp4|tcp4-client) ;;
+        *) die "The SSL .ovpn must use TCP (found '${profile_proto:-no proto}')."; return 1 ;;
+    esac
+    for key in cafile capath cert key crlfile crlpath psksecrets; do
+        while IFS= read -r value; do
+            [[ -n "${value}" ]] || continue
+            filename="${value}"
+            [[ "${filename}" == /* ]] || filename="$(dirname -- "${SSL_CONFIG}")/${filename}"
+            [[ -r "${filename}" ]] || die "stunnel ${key} is not readable: ${filename}" || return
+        done < <(ssl_value "${key}")
+    done
+}
+
+write_ssl_config() {
+    local output="$1" directory
+    directory="$(dirname -- "${SSL_CONFIG}")"
+    # Preserve all TLS/verification settings. Only process/logging settings and
+    # listener normalization change; file paths become absolute before startup.
+    {
+        printf '# Managed by vm-ovpnssl-pat\nforeground = yes\nsyslog = no\npid =\n'
+        printf 'output = %s/stunnel.log\n' "${RUN_DIR}"
+        awk -v directory="${directory}" -v port="${SSL_LOCAL_PORT}" '
+            function trim(s) {gsub(/^[ \t]+|[ \t]+$/, "", s); return s}
+            {sub(/\r$/, "")}
+            /^[ \t]*($|#|;|\[)/ {print; next}
+            {
+                eq=index($0,"="); key=tolower(trim(substr($0,1,eq-1))); value=trim(substr($0,eq+1))
+                if (key ~ /^(foreground|syslog|pid|output|log)$/) next
+                if (key == "accept") {print "accept = 127.0.0.1:" port; next}
+                if (key ~ /^(cafile|capath|cert|key|crlfile|crlpath|psksecrets)$/ && value !~ /^\//)
+                    value=directory "/" value
+                print substr($0,1,eq) " " value
+            }
+        ' "${SSL_CONFIG}"
+    } > "${output}"
+}
+
+ssl_pid() {
+    local pid executable argument found=0
+    [[ -r "${RUN_DIR}/stunnel.pid" ]] || return 1
+    read -r pid < "${RUN_DIR}/stunnel.pid" || return 1
+    [[ "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 1 && -r "/proc/${pid}/cmdline" ]] || return 1
+    executable="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || return 1
+    executable="${executable% (deleted)}"
+    [[ "${executable}" == "${SSL_BIN}" ]] || return 1
+    while IFS= read -r -d '' argument; do
+        [[ "${argument}" != "${RUN_DIR}/stunnel.conf" ]] || found=1
+    done < "/proc/${pid}/cmdline"
+    (( found )) && kill -0 "${pid}" 2>/dev/null || return 1
+    printf '%s\n' "${pid}"
+}
+
+ssl_listener_ready() {
+    local pid port_hex inode descriptor target
+    pid="$(ssl_pid)" || return 1
+    printf -v port_hex '%04X' "${SSL_LOCAL_PORT}"
+    inode="$(awk -v endpoint="0100007F:${port_hex}" '$2 == endpoint && $4 == "0A" {print $10}' /proc/net/tcp)"
+    [[ "${inode}" =~ ^[0-9]+$ ]] || return 1
+    for descriptor in "/proc/${pid}/fd/"*; do
+        target="$(readlink "${descriptor}" 2>/dev/null || true)"
+        if [[ "${target}" == "socket:[${inode}]" ]]; then return 0; fi
+    done
+    return 1
+}
+
+stop_ssl() {
+    local pid attempt recorded_pid
+    if pid="$(ssl_pid)"; then
+        kill -TERM "${pid}" || return
+        for ((attempt=0; attempt<10; attempt++)); do
+            if ! ssl_pid >/dev/null; then break; fi
+            sleep 1
+        done
+        if ssl_pid >/dev/null; then die "stunnel did not stop; keeping gateway protection."; return 1; fi
+    elif [[ -r "${RUN_DIR}/stunnel.pid" ]]; then
+        read -r recorded_pid < "${RUN_DIR}/stunnel.pid" || true
+        if [[ "${recorded_pid:-}" =~ ^[0-9]+$ ]] && kill -0 "${recorded_pid}" 2>/dev/null; then
+            die "stunnel PID file refers to an unrelated process; refusing to signal it."
+            return 1
+        fi
+    fi
+    rm -f -- "${RUN_DIR}/stunnel.pid"
+}
+
+start_ssl() {
+    local pid deadline="$((SECONDS + SSL_START_TIMEOUT))"
+    # Foreground stunnel keeps the launch PID; nohup protects it from the calling
+    # terminal. Close the gateway lock descriptor in the background process.
+    nohup "${SSL_BIN}" "${RUN_DIR}/stunnel.conf" </dev/null \
+        >>"${RUN_DIR}/stunnel.console.log" 2>&1 9>&- &
+    pid=$!
+    printf '%s\n' "${pid}" > "${RUN_DIR}/stunnel.pid"
+    disown "${pid}"
+    while (( SECONDS < deadline )); do
+        if ssl_listener_ready; then return 0; fi
+        if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+        sleep 1
+    done
+    echo >&2 "ERROR: stunnel did not open 127.0.0.1:${SSL_LOCAL_PORT}. VM traffic remains blocked."
+    tail -n 30 "${RUN_DIR}/stunnel.console.log" >&2 2>/dev/null || true
+    tail -n 30 "${RUN_DIR}/stunnel.log" >&2 2>/dev/null || true
+    return 1
+}
+
+check_other_gateway() {
+    local conflict
+    conflict="$(ip -4 -N rule show | awk -v subnet="${VM_CIDR}" -v table="${OVPN_TABLE}" '
+        $2 == "from" && $3 == subnet && $4 == "lookup" && $5 != table {print}
+    ')"
+    [[ -z "${conflict}" ]] || die "Another gateway routes ${VM_CIDR}. Run its down command first: ${conflict}" || return
+}
+
+up() {
+    select_profiles
+    validate_ssl_pair
+    check_other_gateway
+    ip link show "${VM_BRIDGE}" >/dev/null 2>&1 || die "VM bridge ${VM_BRIDGE} does not exist; run virtstart first." || return
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        command -v ip6tables >/dev/null 2>&1 || die "ip6tables is required when BLOCK_VM_IPV6=1." || return
+    fi
+    write_ssl_config "${RUN_DIR}/stunnel.conf.new"
+    write_runtime_config "${RUN_DIR}/ssl-openvpn.check"
+    validate_runtime_config "${RUN_DIR}/ssl-openvpn.check"
+    rm -f -- "${RUN_DIR}/ssl-openvpn.check"
+    save_settings
+    install_firewall
+    install_policy
+    configure_sysctls
+    stop_openvpn
+    stop_ssl
+    mv -f -- "${RUN_DIR}/stunnel.conf.new" "${RUN_DIR}/stunnel.conf"
+    echo "Starting stunnel: 127.0.0.1:${SSL_LOCAL_PORT} -> ${SSL_REMOTE}..."
+    if ! start_ssl; then
+        stop_ssl || true
+        return 1
+    fi
+    # A fresh Bash keeps errexit effective even when repair/watch use conditionals.
+    if ! bash -e -c 'source "$1"; RUN_DIR="$2"; load_settings; gateway_up' \
+        vm-ovpnssl-pat "${SSL_SCRIPT}" "${RUN_DIR}"; then
+        stop_openvpn || true
+        stop_ssl || true
+        return 1
+    fi
+    echo "  SSL profile: ${SSL_CONFIG}"
+    echo "  SSL log:     ${RUN_DIR}/stunnel.log"
+}
+
+wait_connected() {
+    local deadline="$((SECONDS + CONNECT_TIMEOUT))"
+    while (( SECONDS < deadline )); do
+        if ! ssl_listener_ready; then
+            echo >&2 "ERROR: stunnel stopped while OpenVPN was connecting."
+            tail -n 30 "${RUN_DIR}/stunnel.log" >&2 2>/dev/null || true
+            return 1
+        fi
+        if [[ -r "${RUN_DIR}/connection" ]] && daemon_pid >/dev/null &&
+            ip -4 addr show dev "${OVPN_IF}" scope global 2>/dev/null | grep -q 'inet '; then return 0; fi
+        if [[ -e "${RUN_DIR}/openvpn.pid" ]] && ! daemon_pid >/dev/null; then break; fi
+        sleep 1
+    done
+    echo >&2 "OpenVPN-over-SSL did not connect within ${CONNECT_TIMEOUT}s. VM traffic remains blocked."
+    tail -n 30 "${RUN_DIR}/openvpn.log" >&2 2>/dev/null || true
+    tail -n 30 "${RUN_DIR}/stunnel.log" >&2 2>/dev/null || true
+    return 1
+}
+
+down() {
+    # Stop both processes before the base gateway removes leak protection.
+    stop_openvpn
+    stop_ssl
+    gateway_down
+    rm -f -- "${RUN_DIR}/stunnel.conf" "${RUN_DIR}/stunnel.conf.new" "${RUN_DIR}/ssl-openvpn.check"
+    echo "OpenVPN-over-SSL is down; stunnel logs remain in ${RUN_DIR}."
+}
+
+status() {
+    local pid
+    echo "VM OpenVPN-over-SSL gateway"
+    echo "SSL profile: ${SSL_CONFIG:-not configured}"
+    echo "SSL endpoint: ${SSL_REMOTE:-not configured}"
+    if pid="$(ssl_pid)"; then echo "stunnel: running (PID ${pid})"; else echo "stunnel: DOWN"; fi
+    if ssl_listener_ready; then echo "SSL listener: 127.0.0.1:${SSL_LOCAL_PORT} ready"; else echo "SSL listener: DOWN"; fi
+    echo "SSL log: ${RUN_DIR}/stunnel.log"
+    gateway_status
+}
+
+ssl_remote_ip() {
+    local host="${SSL_REMOTE%:*}"
+    host="${host#[}"
+    host="${host%]}"
+    if [[ "${host}" == *:* || "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s\n' "${host}"
+    else
+        getent ahostsv4 "${host}" | awk 'NR == 1 {print $1}'
+    fi
+}
+
+check_endpoint() {
+    local remote route family=-4
+    gateway_check_endpoint
+    check_cmd "Managed stunnel process is running" ssl_pid
+    check_cmd "stunnel owns the SSL loopback listener" ssl_listener_ready
+    remote="$(ssl_remote_ip || true)"
+    if [[ -z "${remote}" ]]; then print_fail "Cannot resolve outer SSL endpoint ${SSL_REMOTE}"; return; fi
+    [[ "${remote}" != *:* ]] || family=-6
+    if route="$(ip "${family}" route get "${remote}" 2>&1)"; then
+        if [[ " ${route} " == *" dev ${OVPN_IF} "* || " ${route} " == *" dev ${VM_BRIDGE} "* ]]; then
+            print_fail "Outer SSL endpoint uses the VM/VPN route: ${route}"
+        else
+            print_ok "Outer SSL endpoint ${SSL_REMOTE} uses the host route: ${route}"
+        fi
+    else
+        print_fail "Host cannot route to outer SSL endpoint: ${route}"
+    fi
+}
+
+repair() {
+    echo "Restarting stunnel and the VM OpenVPN gateway..."
+    bash -e -c 'source "$1"; RUN_DIR="$2"; load_settings; validate_settings; up' \
+        vm-ovpnssl-pat "${SSL_SCRIPT}" "${RUN_DIR}" || return 1
+    check
+}
+
+trace() {
+    local remote filter
+    command -v tcpdump >/dev/null 2>&1 || die "tcpdump is required for trace." || return
+    remote="$(ssl_remote_ip || true)"
+    filter="net ${VM_CIDR} or tcp port ${SSL_LOCAL_PORT:-1413}"
+    if [[ "${remote}" =~ ^[0-9a-fA-F:.]+$ ]]; then filter="${filter} or host ${remote}"; fi
+    echo "Capturing VM, local OpenVPN and outer TLS traffic: ${filter}"
+    flock -u 9
+    tcpdump -ni any "${filter}"
+}
+
+debug() {
+    ssl_listener_ready || die "stunnel is not ready; run repair first." || return
+    gateway_debug "$@"
+}
+
+dump() {
+    gateway_dump
+    echo "stunnel version:"
+    "${SSL_BIN}" -version 2>&1
+    echo "Last 80 stunnel log lines:"
+    tail -n 80 "${RUN_DIR}/stunnel.log" 2>/dev/null || true
+    echo "Last 40 stunnel startup lines:"
+    tail -n 40 "${RUN_DIR}/stunnel.console.log" 2>/dev/null || true
+}
+
+main() {
+    local action="${1:-}"
+    case "${action}" in
+        -h|--help|help|"") usage; return 0 ;;
+        up|start|enable) [[ $# -le 3 ]] || die "Usage: $0 up [directory|client.ovpn] [client.ssl]" || return 64 ;;
+        debug) [[ $# == 2 && ( "$2" == on || "$2" == off ) ]] || die "Usage: $0 debug on|off" || return 64 ;;
+        down|stop|disable|status|check|repair|watch|trace|mtu-test|dump) [[ $# == 1 ]] || die "Unexpected arguments for ${action}." || return 64 ;;
+        *) usage >&2; return 64 ;;
+    esac
+    require_root
+    require_cmds
+    umask 077
+    prepare_runtime
+    load_settings
+    if [[ "${action}" =~ ^(up|start|enable)$ && $# -ge 2 ]]; then
+        OVPN_CONFIG="$2"
+        SSL_CONFIG="${3:-}"
+    fi
+    validate_settings
+    case "${action}" in
+        up|start|enable) up ;;
+        down|stop|disable) down ;;
+        status) status ;;
+        check) check ;;
+        repair) repair ;;
+        watch) watch ;;
+        trace) trace ;;
+        mtu-test) mtu_test ;;
+        dump) dump ;;
+        debug) debug "$2" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

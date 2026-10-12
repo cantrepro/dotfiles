@@ -1,0 +1,949 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Route only the KVM guest subnet behind VM_BRIDGE through an OpenVPN TUN.
+# Host default routes and DNS are left alone; configure DNS inside the VM.
+# Requires Linux, OpenVPN 2.5+, iproute2, iptables, and ip6tables (by default).
+#
+# Usage:
+#   sudo vm-ovpn-pat up [client.ovpn]
+#   sudo vm-ovpn-pat down|status|check|repair|watch|trace|mtu-test|dump
+#   sudo vm-ovpn-pat debug on|off
+#
+# A normal TLS client profile is supported, including <connection> blocks,
+# inline certificates/keys, and relative certificate/auth-user-pass filenames.
+# Profile route/DNS options, up/down hooks, privilege changes and process
+# settings are replaced by this script. TAP, nested configs, plugins and custom
+# authentication/verification hooks are rejected. OpenVPN stays root so its
+# reconnect hooks can maintain policy routing. The original profile is untouched.
+# File-backed credentials are recommended for unattended repair/watch/debug.
+# Routing option reference: https://build.openvpn.net/man/openvpn-2.6/openvpn.8.html
+#
+# Startup failure leaves the kill switch installed. Use down to remove it.
+# down restores ordinary VM forwarding; it does not leave a permanent kill switch.
+# Active bridge/interface/table settings are saved for subsequent commands.
+# Run down before changing those settings or switching from vm-wg-pat.
+
+VM_BRIDGE="${VM_BRIDGE:-virbr10}"
+VM_CIDR="${VM_CIDR:-192.168.23.0/24}"
+OVPN_IF="${OVPN_IF:-tun-vm}"
+OVPN_TABLE="${OVPN_TABLE:-51824}"
+OVPN_RULE_PRIO="${OVPN_RULE_PRIO:-1001}"
+OVPN_CONFIG="${OVPN_CONFIG:-/etc/openvpn/client/vm.conf}"
+FWD_CHAIN="${FWD_CHAIN:-VMOVPN_FORWARD}"
+V6_FWD_CHAIN="${V6_FWD_CHAIN:-VMOVPN6_FORWARD}"
+BLOCK_HOST_DNS="${BLOCK_HOST_DNS:-1}"
+BLOCK_VM_IPV6="${BLOCK_VM_IPV6:-1}"
+
+RUN_DIR="${VM_OVPN_RUN_DIR:-/run/vm-ovpn-pat}"
+CHECK_IP="${VM_OVPN_CHECK_IP:-1.1.1.1}"
+CHECK_IP2="${VM_OVPN_CHECK_IP2:-1.0.0.1}"
+CHECK_HOST="${VM_OVPN_CHECK_HOST:-cloudflare.com}"
+CONNECT_TIMEOUT="${VM_OVPN_CONNECT_TIMEOUT:-60}"
+WATCH_INTERVAL="${VM_OVPN_WATCH_INTERVAL:-30}"
+WATCH_FAILURES="${VM_OVPN_WATCH_FAILURES:-2}"
+VERB="${VM_OVPN_VERB:-3}"
+FAILURES=0
+
+usage() {
+    cat <<USAGE
+Usage:
+  sudo $0 up [client.ovpn]
+  sudo $0 down
+  sudo $0 status
+  sudo $0 check
+  sudo $0 repair
+  sudo $0 watch
+  sudo $0 trace
+  sudo $0 mtu-test
+  sudo $0 dump
+  sudo $0 debug on|off
+
+Environment overrides:
+  VM_BRIDGE=${VM_BRIDGE}
+  VM_CIDR=${VM_CIDR}
+  OVPN_IF=${OVPN_IF}
+  OVPN_TABLE=${OVPN_TABLE}
+  OVPN_RULE_PRIO=${OVPN_RULE_PRIO}
+  OVPN_CONFIG=${OVPN_CONFIG}
+  BLOCK_HOST_DNS=${BLOCK_HOST_DNS}
+  BLOCK_VM_IPV6=${BLOCK_VM_IPV6}
+  FWD_CHAIN=${FWD_CHAIN}
+  V6_FWD_CHAIN=${V6_FWD_CHAIN}
+  VM_OVPN_RUN_DIR=${RUN_DIR}
+  VM_OVPN_CONNECT_TIMEOUT=${CONNECT_TIMEOUT}
+  VM_OVPN_CHECK_IP=${CHECK_IP}
+  VM_OVPN_CHECK_IP2=${CHECK_IP2}
+  VM_OVPN_CHECK_HOST=${CHECK_HOST}
+  VM_OVPN_WATCH_INTERVAL=${WATCH_INTERVAL}
+  VM_OVPN_WATCH_FAILURES=${WATCH_FAILURES}
+  VM_OVPN_VERB=${VERB}
+
+Commands:
+  up          Start/restart the VM OpenVPN gateway using a TLS TUN profile.
+  down        Stop the managed daemon and remove gateway rules.
+  status      Show daemon, tunnel, policy routing, and firewall state.
+  check       Check configuration and actively probe tunnel connectivity.
+  repair      Restart using the saved profile, then run check.
+  watch       Check continuously; repair after repeated failures.
+  trace       Capture guest and encrypted OpenVPN traffic (needs tcpdump).
+  mtu-test    Probe usable IPv4 packet sizes through the tunnel.
+  dump        Print runtime diagnostics and the last 80 log lines.
+  debug       Restart with verbosity 6 (on) or 3 (off); follow openvpn.log.
+
+Configure DNS inside the VM. Host DNS and default routes are not replaced.
+Active gateway settings are saved in ${RUN_DIR}; down before changing them.
+Startup failure retains leak protection until an explicit down.
+USAGE
+}
+
+die() { echo >&2 "ERROR: $*"; return 1; }
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root."; }
+
+require_cmds() {
+    local cmd missing=0
+    for cmd in ip iptables sysctl awk sed grep mktemp ping date getent realpath flock openvpn; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo >&2 "Missing required command: ${cmd}"
+            missing=1
+        fi
+    done
+    [[ "${missing}" -eq 0 ]]
+}
+
+validate_settings() {
+    local name value octet prefix address=0 mask
+    local -a octets
+    for name in VM_BRIDGE OVPN_IF; do
+        value="${!name}"
+        [[ "${value}" =~ ^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,14}$ ]] ||
+            die "${name} must be a Linux interface name of at most 15 characters." || return
+    done
+    [[ "${OVPN_IF}" != "${VM_BRIDGE}" ]] || die "Tunnel and bridge must differ." || return
+    for name in FWD_CHAIN V6_FWD_CHAIN; do
+        [[ "${!name}" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,27}$ ]] ||
+            die "${name} must be a valid dedicated iptables chain name." || return
+        case "${!name}" in
+            INPUT|OUTPUT|FORWARD|PREROUTING|POSTROUTING) die "${name} must be a custom chain."; return 1 ;;
+        esac
+    done
+    [[ "${OVPN_TABLE}" =~ ^[0-9]{1,9}$ ]] &&
+        (( 10#${OVPN_TABLE} > 0 && 10#${OVPN_TABLE} != 253 &&
+           10#${OVPN_TABLE} != 254 && 10#${OVPN_TABLE} != 255 )) ||
+        die "OVPN_TABLE must be a dedicated numeric table (not 0, 253, 254 or 255)." || return
+    [[ "${OVPN_RULE_PRIO}" =~ ^[0-9]{1,5}$ ]] &&
+        (( 10#${OVPN_RULE_PRIO} > 0 && 10#${OVPN_RULE_PRIO} < 32766 )) ||
+        die "OVPN_RULE_PRIO must be between 1 and 32765." || return
+    OVPN_TABLE="$((10#${OVPN_TABLE}))"
+    OVPN_RULE_PRIO="$((10#${OVPN_RULE_PRIO}))"
+    [[ "${VM_CIDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] ||
+        die "VM_CIDR must be an IPv4 subnet." || return
+    IFS=. read -r -a octets <<<"${VM_CIDR%/*}"
+    for octet in "${octets[@]}"; do
+        (( 10#${octet} <= 255 )) || die "Invalid VM_CIDR: ${VM_CIDR}" || return
+        address="$(((address << 8) | 10#${octet}))"
+    done
+    prefix="${VM_CIDR#*/}"
+    (( 10#${prefix} > 0 && 10#${prefix} <= 32 )) || die "VM_CIDR prefix must be 1..32." || return
+    mask="$(((0xffffffff << (32 - 10#${prefix})) & 0xffffffff))"
+    (( (address & mask) == address )) || die "VM_CIDR must use the subnet network address." || return
+    printf -v VM_CIDR '%d.%d.%d.%d/%d' "$((address >> 24))" "$(((address >> 16) & 255))" \
+        "$(((address >> 8) & 255))" "$((address & 255))" "$((10#${prefix}))"
+    for name in BLOCK_HOST_DNS BLOCK_VM_IPV6; do
+        [[ "${!name}" =~ ^[01]$ ]] || die "${name} must be 0 or 1." || return
+    done
+    for name in CONNECT_TIMEOUT WATCH_INTERVAL WATCH_FAILURES; do
+        [[ "${!name}" =~ ^[1-9][0-9]{0,5}$ ]] || die "${name} must be a positive integer." || return
+    done
+    [[ "${VERB}" =~ ^[0-9]$ ]] || die "VM_OVPN_VERB must be 0..9." || return
+}
+
+prepare_runtime() {
+    # Keep paths safe for OpenVPN's command-string parser and root-owned hooks.
+    [[ "${RUN_DIR}" =~ ^/[a-zA-Z0-9_./-]+$ && "${RUN_DIR}" != / ]] ||
+        die "VM_OVPN_RUN_DIR must be an absolute path without whitespace." || return
+    [[ "$(realpath -m -- "${RUN_DIR}")" == "${RUN_DIR}" ]] ||
+        die "VM_OVPN_RUN_DIR must be a canonical path without symlinks." || return
+    [[ ! -e "${RUN_DIR}" || ( -d "${RUN_DIR}" && -O "${RUN_DIR}" ) ]] ||
+        die "Runtime directory must be owned by root: ${RUN_DIR}" || return
+    mkdir -p -- "${RUN_DIR}"
+    chmod 700 -- "${RUN_DIR}"
+    # The daemon and hooks must not inherit the command's lock descriptor.
+    exec 9>"${RUN_DIR}/lock"
+    flock -n 9 || die "Another vm-ovpn-pat command is running." || return
+}
+
+load_settings() {
+    local key value
+    [[ -r "${RUN_DIR}/settings" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            VM_BRIDGE|VM_CIDR|OVPN_IF|OVPN_TABLE|OVPN_RULE_PRIO|OVPN_CONFIG|FWD_CHAIN|V6_FWD_CHAIN|BLOCK_HOST_DNS|BLOCK_VM_IPV6)
+                printf -v "${key}" '%s' "${value}" ;;
+        esac
+    done < "${RUN_DIR}/settings"
+}
+
+save_settings() {
+    local key
+    for key in VM_BRIDGE VM_CIDR OVPN_IF OVPN_TABLE OVPN_RULE_PRIO OVPN_CONFIG FWD_CHAIN V6_FWD_CHAIN BLOCK_HOST_DNS BLOCK_VM_IPV6; do
+        printf '%s=%s\n' "${key}" "${!key}"
+    done > "${RUN_DIR}/settings.new"
+    mv -f -- "${RUN_DIR}/settings.new" "${RUN_DIR}/settings"
+}
+
+config_quote() {
+    local value="$1"
+    [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || die "Newlines are not supported in filenames." || return
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "${value}"
+}
+
+sanitize_profile() {
+    awk '
+        function fail(message) {
+            print "Unsupported OpenVPN profile at line " NR ": " message > "/dev/stderr"
+            failed = 1
+            exit 1
+        }
+        BEGIN {
+            managed = "dev dev-type dev-node route route-ipv6 route-gateway route-ipv6-gateway route-metric route-table route-delay route-noexec route-nopull redirect-gateway redirect-private dhcp-option dns dns-updown block-outside-dns block-ipv6 pull-filter up down route-up route-pre-down ipchange script-security user group chroot cd daemon log log-append syslog writepid status status-version verb persist-tun up-restart up-delay down-pre ifconfig-noexec iproute setenv setenv-safe setenv-opt remap-usr1"
+            split(managed, names, " ")
+            for (i in names) skip[names[i]] = 1
+            split("ca cert extra-certs key pkcs12 tls-auth tls-crypt tls-crypt-v2 auth-user-pass http-proxy-user-pass peer-fingerprint", names, " ")
+            for (i in names) inline_ok[names[i]] = 1
+        }
+        {
+            sub(/\r$/, "")
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (inline_tag != "") {
+                print
+                if (line ~ "^</" inline_tag ">[ \t]*$") inline_tag = ""
+                next
+            }
+            if (line ~ /^($|#|;)/) { print; next }
+            if (line ~ /^<\/?connection>[ \t]*$/) { print; next }
+            if (line ~ /^</) {
+                tag = line
+                sub(/^</, "", tag)
+                sub(/>[ \t]*$/, "", tag)
+                if (!(tag in inline_ok)) fail("unsupported inline block " line)
+                inline_tag = tag
+                print
+                next
+            }
+            split(line, fields, /[ \t]+/)
+            option = fields[1]
+            sub(/^--/, "", option)
+            if (option !~ /^[a-zA-Z0-9_-]+$/) fail("quoted/escaped option names are unsupported")
+            argument = fields[2]
+            gsub(/[\047\042]/, "", argument)
+            if (option == "config") fail("flatten nested config files first")
+            if (option == "plugin" || option == "tls-verify" || option == "tls-crypt-v2-verify" ||
+                option == "auth-user-pass-verify" || option == "client-connect" ||
+                option == "client-disconnect" || option == "learn-address")
+                fail("custom authentication/verification hooks and plugins are unsupported")
+            if (option ~ /^server/ || (option == "mode" && argument == "server") ||
+                (option == "proto" && argument ~ /^tcp.*server/)) fail("use a client profile")
+            if ((option == "dev" && argument ~ /^tap/) ||
+                (option == "dev-type" && argument == "tap")) fail("TAP profiles are unsupported; use TUN")
+            if (option in skip || option ~ /^management/) next
+            print
+        }
+        END {
+            if (!failed && inline_tag != "") {
+                print "Unclosed inline block: " inline_tag > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "${OVPN_CONFIG}"
+}
+
+write_runtime_config() {
+    local output="$1" help_text config_dir profile managed help_rc=0
+    config_dir="$(dirname -- "${OVPN_CONFIG}")"
+    profile="$(sanitize_profile)" || return
+    # OpenVPN prints valid help with exit status 1. Inspect its output instead
+    # of treating that status as a fatal startup error under set -e.
+    help_text="$(openvpn --help 2>&1)" || help_rc=$?
+    if (( help_rc > 1 )) || [[ "${help_text}" != *--route-noexec* ]]; then
+        die "Could not read OpenVPN option help (exit ${help_rc})."
+        return 1
+    fi
+    managed="$({
+        printf '\n# Managed by vm-ovpn-pat.\ncd %s\n' "$(config_quote "${config_dir}")"
+        printf 'dev %s\ndev-type tun\nroute-noexec\nroute-nopull\n' "${OVPN_IF}"
+        printf 'pull-filter ignore "redirect-gateway"\npull-filter ignore "redirect-private"\n'
+        printf 'pull-filter ignore "dhcp-option"\npull-filter ignore "dns"\n'
+        printf 'script-security 2\nup-restart\ndown-pre\n'
+        printf 'up %s/route-hook\nroute-up %s/route-hook\ndown %s/route-hook\nroute-pre-down %s/route-hook\n' \
+            "${RUN_DIR}" "${RUN_DIR}" "${RUN_DIR}" "${RUN_DIR}"
+        printf 'writepid %s/openvpn.pid\nstatus %s/openvpn.status 5\nstatus-version 2\n' "${RUN_DIR}" "${RUN_DIR}"
+        printf 'log-append %s/openvpn.log\nverb %s\n' "${RUN_DIR}" "${VERB}"
+        if [[ "${help_text}" == *--disable-dco* ]]; then
+            # Use a normal TUN across versions/topologies and reconnects.
+            printf 'disable-dco\n'
+        fi
+        if [[ "${help_text}" == *--dns-updown* ]]; then
+            printf 'dns-updown disable\n'
+        fi
+    })" || return
+    # One final write propagates disk/write errors even inside up's conditional.
+    printf '%s\n%s\n' "${profile}" "${managed}" > "${output}"
+}
+
+write_route_hook() {
+    {
+        printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+        printf 'OVPN_IF=%q\nOVPN_TABLE=%q\nRUN_DIR=%q\n' "${OVPN_IF}" "${OVPN_TABLE}" "${RUN_DIR}"
+        cat <<'HOOK'
+[[ "${dev:-}" == "${OVPN_IF}" ]] || exit 1
+case "${script_type:-}" in
+    up)
+        sysctl -w "net/ipv4/conf/${OVPN_IF}/rp_filter=0" >/dev/null
+        ;;
+    route-up)
+        # A TUN carries IP packets directly, so a device default works for
+        # subnet, net30 and p2p topologies without guessing the peer gateway.
+        ip -4 addr show dev "${OVPN_IF}" scope global | grep -q 'inet '
+        ip -4 route replace default dev "${OVPN_IF}" table "${OVPN_TABLE}" metric 100
+        umask 077
+        {
+            printf 'connected_at=%s\n' "$(date +%s)"
+            printf 'remote_ip=%s\n' "${trusted_ip:-${trusted_ip6:-}}"
+            printf 'remote_port=%s\n' "${trusted_port:-${remote_port_1:-}}"
+            printf 'proto=%s\n' "${proto:-}"
+        } > "${RUN_DIR}/connection.new"
+        mv -f -- "${RUN_DIR}/connection.new" "${RUN_DIR}/connection"
+        ;;
+    down|route-pre-down)
+        ip -4 route del default dev "${OVPN_IF}" table "${OVPN_TABLE}" metric 100 2>/dev/null || true
+        rm -f -- "${RUN_DIR}/connection"
+        # The source rule and blackhole default remain installed.
+        ;;
+    *) exit 1 ;;
+esac
+HOOK
+    } > "${RUN_DIR}/route-hook"
+    chmod 700 "${RUN_DIR}/route-hook"
+}
+
+validate_runtime_config() {
+    local candidate="$1"
+    local parse_log="${RUN_DIR}/config-check.log"
+    local parse_output="${RUN_DIR}/config-check.stdout"
+    # OpenVPN checks that hook files exist even for --show-ciphers. Preserve
+    # the current hook while a daemon is running; refresh it after stopping.
+    if [[ ! -e "${RUN_DIR}/route-hook" ]]; then
+        write_route_hook || return
+    fi
+    : > "${parse_log}" || return
+    if ! openvpn --config "${candidate}" --log "${parse_log}" --show-ciphers \
+        > "${parse_output}" 2>&1; then
+        echo >&2 "ERROR: OpenVPN rejected the generated client config:"
+        # Early option errors go to stdout; later errors go to OpenVPN's log.
+        cat "${parse_output}" >&2
+        tail -n 40 "${parse_log}" >&2
+        return 1
+    fi
+    rm -f -- "${parse_output}" "${parse_log}"
+}
+
+daemon_pid() {
+    local pid arg executable found=0 expect_config=0
+    [[ -r "${RUN_DIR}/openvpn.pid" ]] || return 1
+    read -r pid < "${RUN_DIR}/openvpn.pid"
+    [[ "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 1 && -r "/proc/${pid}/cmdline" ]] || return 1
+    executable="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || return 1
+    [[ "${executable##*/}" == openvpn || "${executable##*/}" == 'openvpn (deleted)' ]] || return 1
+    # Check the exact managed config argument before sending any signal.
+    while IFS= read -r -d '' arg; do
+        if (( expect_config )); then
+            [[ "${arg}" != "${RUN_DIR}/client.conf" ]] || found=1
+            expect_config=0
+        fi
+        [[ "${arg}" != --config ]] || expect_config=1
+    done < "/proc/${pid}/cmdline"
+    (( found )) && kill -0 "${pid}" 2>/dev/null || return 1
+    printf '%s\n' "${pid}"
+}
+
+stop_openvpn() {
+    local pid attempt
+    if pid="$(daemon_pid)"; then
+        kill -TERM "${pid}"
+        for ((attempt=0; attempt<15; attempt++)); do
+            if ! daemon_pid >/dev/null; then break; fi
+            sleep 1
+        done
+        if daemon_pid >/dev/null; then
+            die "OpenVPN did not stop; keeping gateway rules and runtime files."
+            return 1
+        fi
+    elif [[ -e "${RUN_DIR}/openvpn.pid" ]]; then
+        local recorded_pid
+        read -r recorded_pid < "${RUN_DIR}/openvpn.pid" || true
+        if [[ "${recorded_pid:-}" =~ ^[0-9]+$ ]] && kill -0 "${recorded_pid}" 2>/dev/null; then
+            die "PID file refers to an unrelated process; refusing to stop it."
+            return 1
+        fi
+    fi
+    rm -f -- "${RUN_DIR}/openvpn.pid" "${RUN_DIR}/connection" "${RUN_DIR}/openvpn.status"
+    ip -4 route del default dev "${OVPN_IF}" table "${OVPN_TABLE}" metric 100 2>/dev/null || true
+}
+
+wait_connected() {
+    local deadline="$((SECONDS + CONNECT_TIMEOUT))"
+    while (( SECONDS < deadline )); do
+        if [[ -r "${RUN_DIR}/connection" ]] && daemon_pid >/dev/null &&
+            ip -4 addr show dev "${OVPN_IF}" scope global 2>/dev/null | grep -q 'inet '; then
+            return 0
+        fi
+        # Give the daemon a moment to create its PID file after forking.
+        if [[ -e "${RUN_DIR}/openvpn.pid" ]] && ! daemon_pid >/dev/null; then break; fi
+        sleep 1
+    done
+    echo >&2 "OpenVPN did not connect within ${CONNECT_TIMEOUT}s. VM traffic remains blocked."
+    tail -n 30 "${RUN_DIR}/openvpn.log" >&2 2>/dev/null || true
+    return 1
+}
+
+ipt() { iptables -w "$@"; }
+ip6t() { ip6tables -w "$@"; }
+
+ipt_once() {
+    local operation="$1" table="$2" chain="$3"
+    shift 3
+    ipt -t "${table}" -C "${chain}" "$@" 2>/dev/null ||
+        ipt -t "${table}" "${operation}" "${chain}" "$@"
+}
+
+ipt_delete_all() {
+    local table="$1" chain="$2"
+    shift 2
+    while ipt -t "${table}" -D "${chain}" "$@" 2>/dev/null; do :; done
+}
+
+install_firewall() {
+    # Never flush a live chain during repair: its kill switch must stay active.
+    ipt -N "${FWD_CHAIN}" 2>/dev/null || ipt -S "${FWD_CHAIN}" >/dev/null
+    ipt_once -A filter "${FWD_CHAIN}" -i "${OVPN_IF}" -o "${VM_BRIDGE}" -d "${VM_CIDR}" \
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ipt_once -A filter "${FWD_CHAIN}" -i "${VM_BRIDGE}" -s "${VM_CIDR}" -o "${OVPN_IF}" -j ACCEPT
+    ipt_once -A filter "${FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp-net-unreachable
+    ipt_once -A filter "${FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp-port-unreachable
+    ipt_once -I filter FORWARD -i "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    ipt_once -I filter FORWARD -o "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    ipt_once -A nat POSTROUTING -s "${VM_CIDR}" -o "${OVPN_IF}" -j MASQUERADE
+    ipt_once -A mangle FORWARD -s "${VM_CIDR}" -o "${OVPN_IF}" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    if [[ "${BLOCK_HOST_DNS}" == 1 ]]; then
+        ipt_once -I filter INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p udp --dport 53 -j REJECT
+        ipt_once -I filter INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p tcp --dport 53 -j REJECT
+    fi
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        ip6t -N "${V6_FWD_CHAIN}" 2>/dev/null || ip6t -S "${V6_FWD_CHAIN}" >/dev/null
+        ip6t -C "${V6_FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null ||
+            ip6t -A "${V6_FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited
+        ip6t -C "${V6_FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null ||
+            ip6t -A "${V6_FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited
+        ip6t -C FORWARD -i "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" 2>/dev/null ||
+            ip6t -I FORWARD 1 -i "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+        ip6t -C FORWARD -o "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" 2>/dev/null ||
+            ip6t -I FORWARD 1 -o "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+    fi
+}
+
+remove_firewall() {
+    ipt_delete_all filter FORWARD -i "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    ipt_delete_all filter FORWARD -o "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    ipt -F "${FWD_CHAIN}" 2>/dev/null || true
+    ipt -X "${FWD_CHAIN}" 2>/dev/null || true
+    ipt_delete_all nat POSTROUTING -s "${VM_CIDR}" -o "${OVPN_IF}" -j MASQUERADE
+    ipt_delete_all mangle FORWARD -s "${VM_CIDR}" -o "${OVPN_IF}" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ipt_delete_all filter INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p udp --dport 53 -j REJECT
+    ipt_delete_all filter INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p tcp --dport 53 -j REJECT
+    if command -v ip6tables >/dev/null 2>&1; then
+        while ip6t -D FORWARD -i "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" 2>/dev/null; do :; done
+        while ip6t -D FORWARD -o "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" 2>/dev/null; do :; done
+        ip6t -F "${V6_FWD_CHAIN}" 2>/dev/null || true
+        ip6t -X "${V6_FWD_CHAIN}" 2>/dev/null || true
+    fi
+}
+
+policy_rule_exists() {
+    ip -4 -N rule show | awk -v priority="${OVPN_RULE_PRIO}:" -v subnet="${VM_CIDR}" -v table="${OVPN_TABLE}" '
+        $1 == priority && $2 == "from" && $3 == subnet && $4 == "lookup" && $5 == table { found = 1 }
+        END { exit !found }
+    '
+}
+
+install_policy() {
+    ip -4 route replace blackhole default table "${OVPN_TABLE}" metric 32767
+    ip -4 route replace "${VM_CIDR}" dev "${VM_BRIDGE}" table "${OVPN_TABLE}" scope link
+    if ! policy_rule_exists; then
+        ip -4 rule add priority "${OVPN_RULE_PRIO}" from "${VM_CIDR}" table "${OVPN_TABLE}"
+    fi
+}
+
+remove_policy() {
+    while ip -4 rule del priority "${OVPN_RULE_PRIO}" from "${VM_CIDR}" table "${OVPN_TABLE}" 2>/dev/null; do :; done
+    ip -4 route flush table "${OVPN_TABLE}" >/dev/null 2>&1 || true
+}
+
+save_sysctls() {
+    [[ ! -e "${RUN_DIR}/sysctls" ]] || return 0
+    local key value snapshot=""
+    for key in net.ipv4.ip_forward net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter \
+        "net/ipv4/conf/${VM_BRIDGE}/rp_filter"; do
+        value="$(sysctl -n "${key}")" || return
+        snapshot+="${key}=${value}"$'\n'
+    done
+    printf '%s' "${snapshot}" > "${RUN_DIR}/sysctls.new"
+    mv -f -- "${RUN_DIR}/sysctls.new" "${RUN_DIR}/sysctls"
+}
+
+configure_sysctls() {
+    save_sysctls
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+    sysctl -w "net/ipv4/conf/${VM_BRIDGE}/rp_filter=0" >/dev/null
+}
+
+restore_sysctls() {
+    local key value
+    [[ -r "${RUN_DIR}/sysctls" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            net.ipv4.ip_forward|net.ipv4.conf.all.rp_filter|net.ipv4.conf.default.rp_filter|"net/ipv4/conf/${VM_BRIDGE}/rp_filter")
+                [[ "${value}" =~ ^[0-9]+$ ]] && sysctl -w "${key}=${value}" >/dev/null ;;
+        esac
+    done < "${RUN_DIR}/sysctls"
+    rm -f -- "${RUN_DIR}/sysctls"
+}
+
+up() {
+    local version candidate
+    [[ -r "${OVPN_CONFIG}" ]] || die "OpenVPN config not readable: ${OVPN_CONFIG}" || return
+    OVPN_CONFIG="$(realpath -e -- "${OVPN_CONFIG}")"
+    [[ "${OVPN_CONFIG}" != *$'\n'* && "${OVPN_CONFIG}" != *$'\r'* ]] || die "Unsupported config filename." || return
+    version="$(openvpn --version)"
+    version="${version#OpenVPN }"
+    [[ "${version}" =~ ^2\.([0-9]+)\. ]] && (( BASH_REMATCH[1] >= 5 )) ||
+        die "OpenVPN 2.5 or later is required." || return
+    ip link show "${VM_BRIDGE}" >/dev/null 2>&1 || die "VM bridge ${VM_BRIDGE} does not exist; run virtstart first." || return
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        command -v ip6tables >/dev/null 2>&1 || die "ip6tables is required when BLOCK_VM_IPV6=1." || return
+    fi
+    if ! daemon_pid >/dev/null && ip link show "${OVPN_IF}" >/dev/null 2>&1; then
+        die "${OVPN_IF} already exists and is not owned by this script; choose another OVPN_IF."
+        return 1
+    fi
+    # Validate the profile before disturbing a working daemon or any networking.
+    candidate="${RUN_DIR}/client.conf.new"
+    if ! write_runtime_config "${candidate}"; then
+        rm -f -- "${candidate}"
+        return 1
+    fi
+    # A parse-only OpenVPN command catches unsupported options without opening TUN.
+    if ! validate_runtime_config "${candidate}"; then
+        rm -f -- "${candidate}"
+        return 1
+    fi
+    save_settings
+    install_firewall
+    install_policy
+    configure_sysctls
+    stop_openvpn || return
+    mv -f -- "${candidate}" "${RUN_DIR}/client.conf"
+    write_route_hook
+    echo "Starting VM OpenVPN gateway; waiting up to ${CONNECT_TIMEOUT}s..."
+    # Close the flock descriptor so daemonization cannot keep the command locked.
+    if ! openvpn --config "${RUN_DIR}/client.conf" --daemon vm-ovpn-pat 9>&-; then
+        die "OpenVPN failed to start. VM traffic remains blocked; see ${RUN_DIR}/openvpn.log."
+        return 1
+    fi
+    wait_connected || return
+    echo "VM OpenVPN gateway is up."
+    echo "  VM subnet: ${VM_CIDR} via ${VM_BRIDGE}"
+    echo "  Tunnel:    ${OVPN_IF}, policy table ${OVPN_TABLE}, priority ${OVPN_RULE_PRIO}"
+    echo "  Profile:   ${OVPN_CONFIG}"
+    echo "  Log:       ${RUN_DIR}/openvpn.log"
+    echo "Run: sudo $0 check"
+}
+
+down() {
+    # An unused gateway must not flush routes/chains belonging to another setup.
+    if [[ ! -r "${RUN_DIR}/settings" ]]; then
+        echo "VM OpenVPN gateway is already down."
+        return 0
+    fi
+    stop_openvpn || return
+    remove_policy
+    remove_firewall
+    restore_sysctls || return
+    rm -f -- "${RUN_DIR}/settings" "${RUN_DIR}/client.conf" "${RUN_DIR}/client.conf.new" \
+        "${RUN_DIR}/route-hook" "${RUN_DIR}/connection.new" "${RUN_DIR}/settings.new" "${RUN_DIR}/sysctls.new"
+    echo "VM OpenVPN gateway is down. Logs remain in ${RUN_DIR}/openvpn.log."
+}
+
+connection_value() {
+    [[ -r "${RUN_DIR}/connection" ]] || return 0
+    awk -F= -v key="$1" '$1 == key {print substr($0, index($0, "=") + 1); exit}' "${RUN_DIR}/connection"
+}
+
+bridge_ip() {
+    ip -4 -o addr show dev "${VM_BRIDGE}" scope global 2>/dev/null |
+        awk 'NR == 1 {split($4, address, "/"); print address[1]}'
+}
+
+interface_bytes() {
+    local direction="$1" value=0
+    if [[ -r "/sys/class/net/${OVPN_IF}/statistics/${direction}_bytes" ]]; then
+        read -r value < "/sys/class/net/${OVPN_IF}/statistics/${direction}_bytes"
+    fi
+    printf '%s\n' "${value}"
+}
+
+show_counters() {
+    echo "Forwarding counters:"
+    ipt -nvx -L "${FWD_CHAIN}" 2>/dev/null || true
+    echo "NAT counters:"
+    ipt -t nat -nvx -L POSTROUTING 2>/dev/null | grep -F "${OVPN_IF}" || true
+    echo "MSS counters:"
+    ipt -t mangle -nvx -L FORWARD 2>/dev/null | grep -F "${OVPN_IF}" || true
+}
+
+status() {
+    local pid source
+    echo "VM OpenVPN gateway (${VM_CIDR})"
+    if pid="$(daemon_pid)"; then echo "Daemon: running (PID ${pid})"; else echo "Daemon: DOWN"; fi
+    echo "Profile: ${OVPN_CONFIG}"
+    echo "Log: ${RUN_DIR}/openvpn.log"
+    echo "Bridge and tunnel:"
+    ip -br addr show dev "${VM_BRIDGE}" 2>/dev/null || true
+    ip -br addr show dev "${OVPN_IF}" 2>/dev/null || true
+    echo "Connection:"
+    if [[ -r "${RUN_DIR}/connection" ]]; then cat "${RUN_DIR}/connection"; else echo "DISCONNECTED"; fi
+    echo "Policy rules:"
+    ip -4 rule show | grep -F "from ${VM_CIDR}" || true
+    echo "Policy table ${OVPN_TABLE}:"
+    ip -4 route show table "${OVPN_TABLE}" 2>/dev/null || true
+    source="$(bridge_ip || true)"
+    if [[ -n "${source}" ]]; then
+        echo "Route from bridge:"
+        ip -4 route get "${CHECK_IP}" from "${source}" || true
+    fi
+    show_counters
+    echo "Sysctls:"
+    sysctl net.ipv4.ip_forward net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter
+    if [[ -r "${RUN_DIR}/openvpn.status" ]]; then
+        echo "OpenVPN status:"
+        cat "${RUN_DIR}/openvpn.status"
+    fi
+}
+
+print_ok() { printf '[OK] %s\n' "$*"; }
+print_warn() { printf '[WARN] %s\n' "$*"; }
+print_fail() { printf '[FAIL] %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
+
+check_cmd() {
+    local description="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then print_ok "${description}"; else print_fail "${description}"; fi
+}
+
+check_endpoint() {
+    local remote route family=-4
+    remote="$(connection_value remote_ip)"
+    if [[ -z "${remote}" ]]; then print_fail "No authenticated OpenVPN endpoint recorded"; return; fi
+    print_ok "OpenVPN endpoint: ${remote}:$(connection_value remote_port)"
+    [[ "${remote}" != *:* ]] || family=-6
+    if route="$(ip "${family}" route get "${remote}" 2>&1)"; then
+        if [[ " ${route} " == *" dev ${OVPN_IF} "* ]]; then
+            print_fail "VPN endpoint routes through ${OVPN_IF} (routing loop)"
+        else
+            print_ok "Host route to VPN endpoint: ${route}"
+        fi
+    else
+        print_fail "Host cannot route to VPN endpoint: ${route}"
+    fi
+}
+
+check_firewall() {
+    local direction protocol
+    for direction in -i -o; do
+        check_cmd "IPv4 bridge forwarding hook (${direction})" ipt -C FORWARD "${direction}" "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    done
+    check_cmd "VM -> OpenVPN forwarding" ipt -C "${FWD_CHAIN}" -i "${VM_BRIDGE}" -s "${VM_CIDR}" -o "${OVPN_IF}" -j ACCEPT
+    check_cmd "Established OpenVPN -> VM replies" ipt -C "${FWD_CHAIN}" -i "${OVPN_IF}" -o "${VM_BRIDGE}" -d "${VM_CIDR}" \
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    check_cmd "VM kill switch" ipt -C "${FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp-net-unreachable
+    check_cmd "Unsolicited traffic into VM is blocked" ipt -C "${FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp-port-unreachable
+    check_cmd "VM NAT/MASQUERADE" ipt -t nat -C POSTROUTING -s "${VM_CIDR}" -o "${OVPN_IF}" -j MASQUERADE
+    check_cmd "TCP MSS clamp" ipt -t mangle -C FORWARD -s "${VM_CIDR}" -o "${OVPN_IF}" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    if [[ "${BLOCK_HOST_DNS}" == 1 ]]; then
+        for protocol in udp tcp; do
+            check_cmd "Host DNS leak protection (${protocol})" ipt -C INPUT -i "${VM_BRIDGE}" -s "${VM_CIDR}" -p "${protocol}" --dport 53 -j REJECT
+        done
+    fi
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        for direction in -i -o; do
+            check_cmd "IPv6 bridge forwarding hook (${direction})" ip6t -C FORWARD "${direction}" "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+            check_cmd "VM IPv6 kill switch (${direction})" ip6t -C "${V6_FWD_CHAIN}" "${direction}" "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited
+        done
+    fi
+}
+
+check_policy() {
+    local routes
+    check_cmd "Source policy rule ${OVPN_RULE_PRIO}: ${VM_CIDR} -> ${OVPN_TABLE}" policy_rule_exists
+    routes="$(ip -4 route show table "${OVPN_TABLE}" 2>/dev/null || true)"
+    if awk -v interface="${OVPN_IF}" '$1 == "default" { for (i=2; i<NF; i++) if ($i == "dev" && $(i+1) == interface) found=1 } END {exit !found}' <<<"${routes}"; then
+        print_ok "Policy default route through ${OVPN_IF}"
+    else
+        print_fail "Policy default route through ${OVPN_IF} is missing"
+    fi
+    if grep -Fq "${VM_CIDR} dev ${VM_BRIDGE}" <<<"${routes}"; then
+        print_ok "Connected VM route in policy table"
+    else
+        print_fail "Connected VM route in policy table is missing"
+    fi
+    if grep -q '^blackhole default' <<<"${routes}"; then print_ok "Blackhole fallback"; else print_fail "Blackhole fallback is missing"; fi
+}
+
+check_active_path() {
+    local source route target before_rx before_tx after_rx after_tx connected=0
+    source="$(bridge_ip || true)"
+    if [[ -z "${source}" ]]; then print_fail "Cannot determine bridge IPv4 address"; return; fi
+    if ! route="$(ip -4 route get "${CHECK_IP}" from "${source}" 2>&1)"; then
+        print_fail "Cannot route from ${source}: ${route}"
+        return
+    fi
+    if [[ " ${route} " != *" dev ${OVPN_IF} "* ]]; then
+        print_fail "Traffic from ${source} bypasses ${OVPN_IF}: ${route}"
+        return
+    fi
+    print_ok "Source route: ${route}"
+    before_rx="$(interface_bytes rx)"
+    before_tx="$(interface_bytes tx)"
+    for target in "${CHECK_IP}" "${CHECK_IP2}"; do
+        if ping -4 -I "${source}" -c 2 -W 2 "${target}" >/dev/null 2>&1; then
+            print_ok "Active tunnel path to ${target}"
+            connected=1
+            break
+        fi
+    done
+    if (( ! connected )); then print_fail "Tunnel ICMP probes failed (${CHECK_IP}, ${CHECK_IP2})"; fi
+    after_rx="$(interface_bytes rx)"
+    after_tx="$(interface_bytes tx)"
+    echo "      TUN counter delta: RX $((after_rx - before_rx)), TX $((after_tx - before_tx)) bytes"
+    # Locally generated probes use source routing and NAT, but bypass FORWARD.
+    print_warn "Source probes do not test guest FORWARD traffic or guest DNS; verify both inside the VM."
+}
+
+check_reverse_path_filters() {
+    local all_value interface key value effective description
+    all_value="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || true)"
+    case "${all_value}" in
+        0|1|2) print_ok "net.ipv4.conf.all.rp_filter=${all_value} (combined with interface values)" ;;
+        *) print_fail "Cannot read a valid net.ipv4.conf.all.rp_filter"; return ;;
+    esac
+    for interface in "${VM_BRIDGE}" "${OVPN_IF}"; do
+        key="net/ipv4/conf/${interface}/rp_filter"
+        value="$(sysctl -n "${key}" 2>/dev/null || true)"
+        case "${value}" in
+            0|1|2) ;;
+            *) print_fail "Cannot read a valid ${key}"; continue ;;
+        esac
+        # Linux uses the maximum of the all and interface values. Loose mode
+        # supports asymmetric routing and may be applied by interface hotplug.
+        effective=$((all_value > value ? all_value : value))
+        if (( effective == 1 )); then
+            print_fail "${key}=${value}, all=${all_value}: effective strict mode may drop policy-routed traffic; use 0 or 2"
+        else
+            description=disabled
+            if (( effective == 2 )); then description=loose; fi
+            print_ok "${key}=${value} (effective ${effective}: ${description})"
+        fi
+    done
+}
+
+check() {
+    FAILURES=0
+    echo "VM OpenVPN health check (${VM_CIDR} -> ${OVPN_IF})"
+    check_cmd "VM bridge exists" ip link show "${VM_BRIDGE}"
+    check_cmd "Managed OpenVPN daemon is running" daemon_pid
+    check_cmd "Authenticated connection is recorded" test -r "${RUN_DIR}/connection"
+    check_cmd "TUN interface exists" ip link show "${OVPN_IF}"
+    if ip -4 addr show dev "${OVPN_IF}" scope global 2>/dev/null | grep -q 'inet '; then
+        print_ok "Tunnel has an IPv4 address"
+    else
+        print_fail "Tunnel has no IPv4 address"
+    fi
+    if [[ "$(sysctl -n net.ipv4.ip_forward)" == 1 ]]; then print_ok "IPv4 forwarding enabled"; else print_fail "IPv4 forwarding disabled"; fi
+    check_reverse_path_filters
+    check_policy
+    check_endpoint
+    check_firewall
+    if ping -4 -c 1 -W 2 "${CHECK_IP}" >/dev/null 2>&1 || ping -4 -c 1 -W 2 "${CHECK_IP2}" >/dev/null 2>&1; then
+        print_ok "Host Internet connectivity"
+    else
+        print_fail "Host Internet ICMP probes failed"
+    fi
+    check_active_path
+    check_cmd "Host DNS resolution: ${CHECK_HOST}" getent ahostsv4 "${CHECK_HOST}"
+    show_counters
+    if (( FAILURES == 0 )); then echo "RESULT: HEALTHY"; return 0; fi
+    echo "RESULT: FAILED (${FAILURES} check(s)); inspect $0 dump and $0 trace."
+    return 1
+}
+
+repair() {
+    echo "Restarting VM OpenVPN gateway using ${OVPN_CONFIG}..."
+    # A fresh Bash preserves errexit when watch calls repair in a conditional.
+    # A conditional subshell would disable errexit even after `set -e`.
+    bash -e -c 'source "$1"; RUN_DIR="$2"; load_settings; validate_settings; up' \
+        vm-ovpn-pat "${BASH_SOURCE[0]}" "${RUN_DIR}" || return 1
+    check
+}
+
+watch() {
+    local failures=0
+    echo "Watching every ${WATCH_INTERVAL}s; repair after ${WATCH_FAILURES} consecutive failures."
+    echo "Press Ctrl-C to stop."
+    # Release the command lock between checks so down/debug remain usable.
+    flock -u 9
+    while true; do
+        if ! flock -n 9; then sleep "${WATCH_INTERVAL}"; continue; fi
+        load_settings
+        if [[ ! -r "${RUN_DIR}/settings" ]]; then
+            echo "Gateway is down; stopping watch."
+            flock -u 9
+            return 0
+        fi
+        if check; then
+            failures=0
+            echo "[$(date '+%F %T')] HEALTHY"
+        else
+            failures=$((failures + 1))
+            echo "[$(date '+%F %T')] FAILED (${failures}/${WATCH_FAILURES})"
+            if (( failures >= WATCH_FAILURES )); then
+                if repair; then failures=0; else echo "Automatic repair failed; inspect ${RUN_DIR}/openvpn.log."; fi
+            fi
+        fi
+        flock -u 9
+        sleep "${WATCH_INTERVAL}"
+    done
+}
+
+mtu_test() {
+    local source size largest=0 route
+    source="$(bridge_ip || true)"
+    [[ -n "${source}" ]] || die "Cannot determine bridge IPv4 address." || return
+    route="$(ip -4 route get "${CHECK_IP}" from "${source}")" || return
+    [[ " ${route} " == *" dev ${OVPN_IF} "* ]] || die "Probe source does not route through ${OVPN_IF}." || return
+    echo "Testing MTU through ${OVPN_IF}, source ${source}, target ${CHECK_IP}"
+    for size in 1472 1452 1420 1400 1380 1360 1340 1320 1300 1280; do
+        printf '  payload %s (%s byte IPv4 packet): ' "${size}" "$((size + 28))"
+        if ping -4 -I "${source}" -M do -s "${size}" -c 1 -W 2 "${CHECK_IP}" >/dev/null 2>&1; then
+            echo OK
+            if (( size > largest )); then largest="${size}"; fi
+        else
+            echo FAIL
+        fi
+    done
+    if (( largest == 0 )); then die "No size succeeded; check connectivity and ICMP filtering."; return 1; fi
+    echo "Largest tested working IPv4 packet: $((largest + 28)) bytes (payload ${largest})."
+}
+
+trace() {
+    local remote filter
+    command -v tcpdump >/dev/null 2>&1 || die "tcpdump is required for trace." || return
+    remote="$(connection_value remote_ip)"
+    filter="net ${VM_CIDR}"
+    if [[ "${remote}" =~ ^[0-9a-fA-F:.]+$ ]]; then filter="${filter} or host ${remote}"; fi
+    echo "Capturing guest and OpenVPN traffic: ${filter}"
+    echo "Look for packets on ${VM_BRIDGE}, encrypted UDP/TCP traffic, and replies. Ctrl-C to stop."
+    flock -u 9
+    tcpdump -ni any "${filter}"
+}
+
+debug() {
+    local action="${1:-}" pid
+    case "${action}" in
+        on) VERB=6 ;;
+        off) VERB=3 ;;
+        *) die "Usage: $0 debug on|off"; return 64 ;;
+    esac
+    pid="$(daemon_pid)" || die "Managed OpenVPN daemon is not running." || return
+    [[ -r "${RUN_DIR}/client.conf" ]] || die "Runtime config is missing." || return
+    # Only our final verb directive exists in the sanitized config.
+    sed -i "s/^verb [0-9][0-9]*$/verb ${VERB}/" "${RUN_DIR}/client.conf"
+    rm -f -- "${RUN_DIR}/connection"
+    ip -4 route del default dev "${OVPN_IF}" table "${OVPN_TABLE}" metric 100 2>/dev/null || true
+    kill -HUP "${pid}"
+    wait_connected || return
+    echo "OpenVPN verbosity is ${VERB}. Follow: tail -f ${RUN_DIR}/openvpn.log"
+}
+
+dump() {
+    echo "VM-OVPN-PAT diagnostic dump — $(date --iso-8601=seconds)"
+    status
+    echo "Main IPv4 routing table:"
+    ip -4 route show table main
+    echo "Main IPv6 routing table:"
+    ip -6 route show table main
+    echo "Gateway firewall rules:"
+    ipt -S "${FWD_CHAIN}" 2>/dev/null || true
+    ipt -t nat -S POSTROUTING 2>/dev/null | grep -F "${OVPN_IF}" || true
+    ipt -t mangle -S FORWARD 2>/dev/null | grep -F "${OVPN_IF}" || true
+    ipt -S INPUT 2>/dev/null | grep -F "${VM_BRIDGE}" || true
+    if command -v ip6tables >/dev/null 2>&1; then ip6t -S "${V6_FWD_CHAIN}" 2>/dev/null || true; fi
+    echo "OpenVPN version:"
+    openvpn --version
+    echo "Last 80 OpenVPN log lines:"
+    tail -n 80 "${RUN_DIR}/openvpn.log" 2>/dev/null || true
+}
+
+main() {
+    local action="${1:-}"
+    case "${action}" in
+        -h|--help|help|"") usage; return 0 ;;
+        up|start|enable|down|stop|disable|status|check|repair|watch|trace|mtu-test|dump|debug) ;;
+        *) usage >&2; return 64 ;;
+    esac
+    if [[ "${action}" == debug ]]; then
+        [[ $# == 2 && ( "$2" == on || "$2" == off ) ]] || die "Usage: $0 debug on|off" || return 64
+    elif [[ "${action}" =~ ^(up|start|enable)$ ]]; then
+        [[ $# -le 2 ]] || die "Usage: $0 up [client.ovpn]" || return 64
+    else
+        [[ $# == 1 ]] || die "Unexpected arguments for ${action}." || return 64
+    fi
+    require_root
+    require_cmds
+    umask 077
+    prepare_runtime
+    load_settings
+    if [[ "${action}" =~ ^(up|start|enable)$ && $# == 2 ]]; then OVPN_CONFIG="$2"; fi
+    validate_settings
+    case "${action}" in
+        up|start|enable) up ;;
+        down|stop|disable) down ;;
+        status) status ;;
+        check) check ;;
+        repair) repair ;;
+        watch) watch ;;
+        trace) trace ;;
+        mtu-test) mtu_test ;;
+        dump) dump ;;
+        debug) debug "$2" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
