@@ -1,0 +1,2196 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Route only the KVM guest subnet behind VM_BRIDGE through AmneziaWG.
+#
+# This intentionally does NOT use awg-quick:
+#   - awg-quick may install a 0.0.0.0/0 route in the host's main table
+#   - this script instead uses source-based policy routing
+#
+# Usage:
+#   sudo vm-awg-pat up [amneziawg.conf]
+#   sudo vm-awg-pat down
+#   sudo vm-awg-pat status
+#   sudo vm-awg-pat check
+#   sudo vm-awg-pat repair
+#   sudo vm-awg-pat watch
+#   sudo vm-awg-pat trace
+#   sudo vm-awg-pat mtu-test
+#   sudo vm-awg-pat dump
+#   sudo vm-awg-pat debug on|off
+#
+# Optional:
+#   VM_AWG_CHECK_IP=1.1.1.1
+#   VM_AWG_CHECK_IP2=1.0.0.1
+#   VM_AWG_CHECK_HOST=cloudflare.com
+#   VM_AWG_HANDSHAKE_MAX_AGE=180
+#   VM_AWG_WATCH_INTERVAL=30
+#   VM_AWG_WATCH_FAILURES=2
+#   VM_AWG_LOG_LEVEL=error       # debug, error, or silent
+#   VM_AWG_LOG_FILE=/var/log/vm-awg-pat.log
+#   VM_AWG_START_TIMEOUT=10
+#   VM_AWG_COMMAND_TIMEOUT=15
+#
+# Expected AmneziaWG config:
+#
+#   [Interface]
+#   Address = 10.x.y.z/32
+#   PrivateKey = ...
+#   MTU = 1420
+#   # Keep all obfuscation parameters from the exported AmneziaWG config.
+#   # Jc, Jmin, Jmax, S1-S4, H1-H4, I1-I5, etc. are passed through to awg.
+#
+#   [Peer]
+#   PublicKey = ...
+#   Endpoint = vpn.example.com:51820
+#   AllowedIPs = 0.0.0.0/0
+#   PersistentKeepalive = 25
+#
+# DNS in the AmneziaWG config is intentionally ignored.
+# Configure DNS inside the VM instead.
+
+VM_BRIDGE="${VM_BRIDGE:-virbr10}"
+VM_CIDR="${VM_CIDR:-192.168.23.0/24}"
+
+AWG_IF="${AWG_IF:-awg-vm}"
+AWG_TABLE="${AWG_TABLE:-51824}"
+AWG_RULE_PRIO="${AWG_RULE_PRIO:-1001}"
+AWG_CONFIG="${AWG_CONFIG:-/etc/amnezia/amneziawg/${AWG_IF}.conf}"
+
+FWD_CHAIN="${FWD_CHAIN:-VMAWG_FORWARD}"
+V6_FWD_CHAIN="${V6_FWD_CHAIN:-VMAWG6_FORWARD}"
+
+BLOCK_HOST_DNS="${BLOCK_HOST_DNS:-1}"
+BLOCK_VM_IPV6="${BLOCK_VM_IPV6:-1}"
+
+CHECK_IP="${VM_AWG_CHECK_IP:-1.1.1.1}"
+CHECK_IP2="${VM_AWG_CHECK_IP2:-1.0.0.1}"
+CHECK_HOST="${VM_AWG_CHECK_HOST:-cloudflare.com}"
+
+HANDSHAKE_MAX_AGE="${VM_AWG_HANDSHAKE_MAX_AGE:-180}"
+WATCH_INTERVAL="${VM_AWG_WATCH_INTERVAL:-30}"
+WATCH_FAILURES="${VM_AWG_WATCH_FAILURES:-2}"
+
+STATE_FILE="${VM_AWG_STATE_FILE:-/run/vm-awg-pat.state}"
+DEBUG_FILE="${VM_AWG_DEBUG_FILE:-/run/vm-awg-pat.debug}"
+AWG_LOG_LEVEL="${VM_AWG_LOG_LEVEL:-error}"
+AWG_LOG_FILE="${VM_AWG_LOG_FILE:-/var/log/vm-awg-pat.log}"
+AWG_START_TIMEOUT="${VM_AWG_START_TIMEOUT:-10}"
+AWG_COMMAND_TIMEOUT="${VM_AWG_COMMAND_TIMEOUT:-15}"
+
+TMP_AWG_CONF=""
+TMP_PING=""
+
+FAILURES=0
+
+cleanup() {
+    [[ -n "${TMP_AWG_CONF}" ]] && rm -f "${TMP_AWG_CONF}"
+    [[ -n "${TMP_PING}" ]] && rm -f "${TMP_PING}"
+    return 0
+}
+trap cleanup EXIT
+
+
+usage() {
+    cat <<USAGE
+Usage:
+  sudo $0 up [amneziawg.conf]
+  sudo $0 down
+  sudo $0 status
+  sudo $0 check
+  sudo $0 repair
+  sudo $0 watch
+  sudo $0 trace
+  sudo $0 mtu-test
+  sudo $0 dump
+  sudo $0 debug on|off
+
+Environment overrides:
+  VM_BRIDGE=${VM_BRIDGE}
+  VM_CIDR=${VM_CIDR}
+  AWG_IF=${AWG_IF}
+  AWG_TABLE=${AWG_TABLE}
+  AWG_RULE_PRIO=${AWG_RULE_PRIO}
+  AWG_CONFIG=${AWG_CONFIG}
+
+  BLOCK_HOST_DNS=${BLOCK_HOST_DNS}
+  BLOCK_VM_IPV6=${BLOCK_VM_IPV6}
+
+  VM_AWG_CHECK_IP=${CHECK_IP}
+  VM_AWG_CHECK_IP2=${CHECK_IP2}
+  VM_AWG_CHECK_HOST=${CHECK_HOST}
+
+  VM_AWG_HANDSHAKE_MAX_AGE=${HANDSHAKE_MAX_AGE}
+  VM_AWG_WATCH_INTERVAL=${WATCH_INTERVAL}
+  VM_AWG_WATCH_FAILURES=${WATCH_FAILURES}
+
+  VM_AWG_STATE_FILE=${STATE_FILE}
+  VM_AWG_DEBUG_FILE=${DEBUG_FILE}
+  VM_AWG_LOG_LEVEL=${AWG_LOG_LEVEL}
+  VM_AWG_LOG_FILE=${AWG_LOG_FILE}
+  VM_AWG_START_TIMEOUT=${AWG_START_TIMEOUT}
+  VM_AWG_COMMAND_TIMEOUT=${AWG_COMMAND_TIMEOUT}
+
+Commands:
+  up          Configure/reconfigure the VM AmneziaWG gateway.
+  down        Remove the gateway configuration.
+  status      Show runtime state without performing active tests.
+  check       Perform detailed health checks and active connectivity tests.
+  repair      Reapply configuration and then run check.
+  watch       Monitor continuously and repair after repeated failures.
+  trace       Run tcpdump for VM/AmneziaWG traffic.
+  mtu-test    Probe the usable path MTU through the tunnel.
+  dump        Print a useful diagnostic bundle.
+  debug       Enable/disable userspace debug logging for the next start.
+USAGE
+}
+
+
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        echo >&2 "Run as root."
+        exit 1
+    fi
+}
+
+
+require_cmds() {
+    local missing=0
+
+    for cmd in ip awg iptables sysctl awk sed grep mktemp ping date getent env timeout; do
+        if ! type -P "${cmd}" >/dev/null 2>&1; then
+            echo >&2 "Missing required command: ${cmd}"
+            missing=1
+        fi
+    done
+
+    [[ "${missing}" -eq 0 ]] || exit 2
+}
+
+
+ipt() {
+    iptables -w 5 "$@"
+}
+
+
+ip6t() {
+    ip6tables -w 5 "$@"
+}
+
+
+awg() {
+    local rc=0
+
+    timeout --kill-after=2s "${AWG_COMMAND_TIMEOUT}s" awg "$@" || rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        echo >&2 "Timed out waiting for awg ${1:-} ${2:-}; see ${AWG_LOG_FILE}."
+    fi
+
+    return "${rc}"
+}
+
+
+ipt_append_once() {
+    local table_args=()
+
+    if [[ "${1:-}" == "-t" ]]; then
+        table_args=(-t "$2")
+        shift 2
+    fi
+
+    local chain="$1"
+    shift
+
+    ipt "${table_args[@]}" -C "${chain}" "$@" 2>/dev/null || \
+        ipt "${table_args[@]}" -A "${chain}" "$@"
+}
+
+
+ipt_insert_once() {
+    local table_args=()
+
+    if [[ "${1:-}" == "-t" ]]; then
+        table_args=(-t "$2")
+        shift 2
+    fi
+
+    local chain="$1"
+    shift
+
+    ipt "${table_args[@]}" -C "${chain}" "$@" 2>/dev/null || \
+        ipt "${table_args[@]}" -I "${chain}" 1 "$@"
+}
+
+
+ipt_delete_all() {
+    local table_args=()
+
+    if [[ "${1:-}" == "-t" ]]; then
+        table_args=(-t "$2")
+        shift 2
+    fi
+
+    local chain="$1"
+    shift
+
+    while ipt "${table_args[@]}" -D "${chain}" "$@" 2>/dev/null; do
+        :
+    done
+}
+
+
+ip6t_insert_once() {
+    command -v ip6tables >/dev/null 2>&1 || return 0
+
+    local chain="$1"
+    shift
+
+    ip6t -C "${chain}" "$@" 2>/dev/null || \
+        ip6t -I "${chain}" 1 "$@"
+}
+
+
+ip6t_delete_all() {
+    command -v ip6tables >/dev/null 2>&1 || return 0
+
+    local chain="$1"
+    shift
+
+    while ip6t -D "${chain}" "$@" 2>/dev/null; do
+        :
+    done
+}
+
+
+# ---------------------------------------------------------------------------
+# Configuration parsing
+# ---------------------------------------------------------------------------
+
+awg_config_addresses() {
+    awk '
+        function trim(s) {
+            gsub(/^[ \t]+|[ \t]+$/, "", s)
+            return s
+        }
+
+        /^[ \t]*($|#|;)/ { next }
+
+        {
+            eq = index($0, "=")
+            if (!eq)
+                next
+
+            key = tolower(trim(substr($0, 1, eq - 1)))
+
+            if (key != "address")
+                next
+
+            val = substr($0, eq + 1)
+            sub(/[ \t]*(#|;).*$/, "", val)
+
+            n = split(val, parts, ",")
+
+            for (i = 1; i <= n; i++) {
+                addr = trim(parts[i])
+                if (addr != "")
+                    print addr
+            }
+        }
+    ' "${AWG_CONFIG}"
+}
+
+
+awg_config_mtu() {
+    awk '
+        function trim(s) {
+            gsub(/^[ \t]+|[ \t]+$/, "", s)
+            return s
+        }
+
+        /^[ \t]*($|#|;)/ { next }
+
+        {
+            eq = index($0, "=")
+            if (!eq)
+                next
+
+            key = tolower(trim(substr($0, 1, eq - 1)))
+
+            if (key != "mtu")
+                next
+
+            val = substr($0, eq + 1)
+            sub(/[ \t]*(#|;).*$/, "", val)
+
+            print trim(val)
+            exit
+        }
+    ' "${AWG_CONFIG}"
+}
+
+
+awg_config_endpoint() {
+    awk '
+        function trim(s) {
+            gsub(/^[ \t]+|[ \t]+$/, "", s)
+            return s
+        }
+
+        /^[ \t]*($|#|;)/ { next }
+
+        {
+            eq = index($0, "=")
+            if (!eq)
+                next
+
+            key = tolower(trim(substr($0, 1, eq - 1)))
+
+            if (key != "endpoint")
+                next
+
+            val = substr($0, eq + 1)
+            sub(/[ \t]*(#|;).*$/, "", val)
+
+            print trim(val)
+            exit
+        }
+    ' "${AWG_CONFIG}"
+}
+
+
+write_awg_setconf_file() {
+    local out="$1"
+
+    # Strip awg-quick-only options.
+    #
+    # IMPORTANT:
+    #   Do not strip Endpoint, AllowedIPs, PersistentKeepalive, etc.
+    #   AmneziaWG obfuscation options must reach awg unchanged.
+    awk '
+        function trim(s) {
+            gsub(/^[ \t]+|[ \t]+$/, "", s)
+            return s
+        }
+
+        /^[ \t]*($|#|;)/ {
+            print
+            next
+        }
+
+        {
+            eq = index($0, "=")
+
+            if (eq) {
+                key = tolower(trim(substr($0, 1, eq - 1)))
+
+                if (key == "address" ||
+                    key == "dns" ||
+                    key == "mtu" ||
+                    key == "table" ||
+                    key == "preup" ||
+                    key == "postup" ||
+                    key == "predown" ||
+                    key == "postdown" ||
+                    key == "saveconfig" ||
+                    key == "fwmark") {
+                    next
+                }
+            }
+
+            print
+        }
+    ' "${AWG_CONFIG}" > "${out}"
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+green() {
+    printf '\033[32m%s\033[0m' "$*"
+}
+
+
+red() {
+    printf '\033[31m%s\033[0m' "$*"
+}
+
+
+yellow() {
+    printf '\033[33m%s\033[0m' "$*"
+}
+
+
+print_ok() {
+    printf '[%s] %s\n' "$(green OK)" "$*"
+}
+
+
+print_fail() {
+    printf '[%s] %s\n' "$(red FAIL)" "$*"
+    FAILURES=$((FAILURES + 1))
+}
+
+
+print_warn() {
+    printf '[%s] %s\n' "$(yellow WARN)" "$*"
+}
+
+
+check_cmd() {
+    local description="$1"
+    shift
+
+    if "$@" >/dev/null 2>&1; then
+        print_ok "${description}"
+        return 0
+    fi
+
+    print_fail "${description}"
+    return 1
+}
+
+
+get_bridge_ip() {
+    ip -4 -o addr show dev "${VM_BRIDGE}" scope global 2>/dev/null |
+        awk 'NR == 1 { split($4, a, "/"); print a[1]; exit }'
+}
+
+
+get_endpoint_runtime() {
+    awg show "${AWG_IF}" endpoints 2>/dev/null |
+        awk '
+            NF >= 2 &&
+            $2 != "(none)" &&
+            $2 != "" {
+                print $2
+                exit
+            }
+        '
+}
+
+
+endpoint_host() {
+    local endpoint="$1"
+
+    # [IPv6]:port
+    if [[ "${endpoint}" =~ ^\[.*\]:[0-9]+$ ]]; then
+        printf '%s\n' "${endpoint#\[}" | sed 's/\].*$//'
+        return
+    fi
+
+    # Plain IPv4/hostname:port.
+    # Endpoint values returned by AmneziaWG are expected to contain a port.
+    printf '%s\n' "${endpoint%:*}"
+}
+
+
+endpoint_port() {
+    local endpoint="$1"
+
+    if [[ "${endpoint}" =~ ^\[.*\]:[0-9]+$ ]]; then
+        printf '%s\n' "${endpoint##*]:}"
+    else
+        printf '%s\n' "${endpoint##*:}"
+    fi
+}
+
+
+endpoint_ip() {
+    local endpoint="$1"
+    local host
+
+    host="$(endpoint_host "${endpoint}")"
+
+    if [[ "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s\n' "${host}"
+        return 0
+    fi
+
+    getent ahostsv4 "${host}" 2>/dev/null |
+        awk 'NR == 1 { print $1; exit }'
+}
+
+
+format_age() {
+    local age="$1"
+
+    if (( age < 0 )); then
+        echo "clock-skew"
+    elif (( age < 60 )); then
+        echo "${age}s ago"
+    elif (( age < 3600 )); then
+        echo "$((age / 60))m ago"
+    elif (( age < 86400 )); then
+        echo "$((age / 3600))h ago"
+    else
+        echo "$((age / 86400))d ago"
+    fi
+}
+
+
+# awg show <interface> dump:
+#
+# For each peer:
+#   $1 = public key
+#   $2 = preshared key
+#   $3 = endpoint
+#   $4 = allowed IPs
+#   $5 = latest handshake epoch
+#   $6 = receive bytes
+#   $7 = transmit bytes
+#   $8 = persistent keepalive
+#
+# The old script incorrectly interpreted these columns, producing output such
+# as:
+#   endpoint: 6508
+#   rx: 185.204.1.203:51820
+#   tx: 0.0.0.0/0,::/0
+#
+# Those were simply shifted columns.
+
+
+sum_awg_transfer() {
+    local field="$1"
+
+    awg show "${AWG_IF}" dump 2>/dev/null |
+        tail -n +2 |
+        awk -v f="${field}" '
+            BEGIN { total = 0 }
+
+            {
+                if ($f ~ /^[0-9]+$/)
+                    total += $f
+            }
+
+            END {
+                print total + 0
+            }
+        '
+}
+
+
+peer_count() {
+    awg show "${AWG_IF}" peers 2>/dev/null | wc -l
+}
+
+
+# Return the age of the OLDEST peer handshake.
+#
+# For a multi-peer configuration, this is intentionally the maximum age.
+# That lets the health check fail when any peer has gone stale.
+max_handshake_age() {
+    local now="$1"
+
+    awg show "${AWG_IF}" latest-handshakes 2>/dev/null |
+        awk -v now="${now}" '
+            $2 ~ /^[0-9]+$/ && $2 > 0 {
+                age = now - $2
+
+                if (age < 0)
+                    age = 0
+
+                if (!found || age > max)
+                    max = age
+
+                found = 1
+            }
+
+            END {
+                if (!found)
+                    print -1
+                else
+                    print max
+            }
+        '
+}
+
+
+has_recent_handshake() {
+    local now="$1"
+    local max_age
+
+    max_age="$(max_handshake_age "${now}")"
+
+    [[ "${max_age}" -ge 0 && "${max_age}" -le "${HANDSHAKE_MAX_AGE}" ]]
+}
+
+
+save_sysctls() {
+    if [[ -e "${STATE_FILE}" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${STATE_FILE}")"
+
+    {
+        printf 'ip_forward=%s\n' \
+            "$(sysctl -n net.ipv4.ip_forward)"
+
+        printf 'all_rp_filter=%s\n' \
+            "$(sysctl -n net.ipv4.conf.all.rp_filter)"
+
+        printf 'default_rp_filter=%s\n' \
+            "$(sysctl -n net.ipv4.conf.default.rp_filter)"
+
+        if [[ -e "/proc/sys/net/ipv4/conf/${VM_BRIDGE}/rp_filter" ]]; then
+            printf 'bridge_rp_filter=%s\n' \
+                "$(sysctl -n "net.ipv4.conf.${VM_BRIDGE}.rp_filter")"
+        fi
+
+        if [[ -e "/proc/sys/net/ipv4/conf/${AWG_IF}/rp_filter" ]]; then
+            printf 'awg_rp_filter=%s\n' \
+                "$(sysctl -n "net.ipv4.conf.${AWG_IF}.rp_filter")"
+        fi
+    } > "${STATE_FILE}"
+
+    chmod 600 "${STATE_FILE}"
+}
+
+
+restore_sysctls() {
+    [[ -r "${STATE_FILE}" ]] || return 0
+
+    local value
+
+    value="$(awk -F= '$1 == "ip_forward" {print $2}' "${STATE_FILE}")"
+    [[ -n "${value}" ]] &&
+        sysctl -w "net.ipv4.ip_forward=${value}" >/dev/null 2>&1 || true
+
+    value="$(awk -F= '$1 == "all_rp_filter" {print $2}' "${STATE_FILE}")"
+    [[ -n "${value}" ]] &&
+        sysctl -w "net.ipv4.conf.all.rp_filter=${value}" >/dev/null 2>&1 || true
+
+    value="$(awk -F= '$1 == "default_rp_filter" {print $2}' "${STATE_FILE}")"
+    [[ -n "${value}" ]] &&
+        sysctl -w "net.ipv4.conf.default.rp_filter=${value}" >/dev/null 2>&1 || true
+
+    value="$(awk -F= '$1 == "bridge_rp_filter" {print $2}' "${STATE_FILE}")"
+    if [[ -n "${value}" ]] &&
+       [[ -e "/proc/sys/net/ipv4/conf/${VM_BRIDGE}/rp_filter" ]]; then
+        sysctl -w \
+            "net.ipv4.conf.${VM_BRIDGE}.rp_filter=${value}" \
+            >/dev/null 2>&1 || true
+    fi
+
+    value="$(awk -F= '$1 == "awg_rp_filter" {print $2}' "${STATE_FILE}")"
+    if [[ -n "${value}" ]] &&
+       [[ -e "/proc/sys/net/ipv4/conf/${AWG_IF}/rp_filter" ]]; then
+        sysctl -w \
+            "net.ipv4.conf.${AWG_IF}.rp_filter=${value}" \
+            >/dev/null 2>&1 || true
+    fi
+
+    rm -f "${STATE_FILE}"
+}
+
+
+# ---------------------------------------------------------------------------
+# Policy routing
+# ---------------------------------------------------------------------------
+
+remove_policy_routing() {
+    # Delete the exact rule installed by this script.
+    while ip -4 rule del \
+        priority "${AWG_RULE_PRIO}" \
+        from "${VM_CIDR}" \
+        table "${AWG_TABLE}" 2>/dev/null; do
+        :
+    done
+
+    ip -4 route flush table "${AWG_TABLE}" >/dev/null 2>&1 || true
+}
+
+
+install_policy_routing() {
+    if ! [[ "${AWG_RULE_PRIO}" =~ ^[0-9]+$ ]]; then
+        echo >&2 "AWG_RULE_PRIO must be numeric."
+        exit 7
+    fi
+
+    if (( AWG_RULE_PRIO >= 32766 )); then
+        echo >&2 \
+            "AWG_RULE_PRIO=${AWG_RULE_PRIO} is too high. Use a value below 32766."
+        exit 7
+    fi
+
+    # Safety net: if the AWG route disappears while the policy rule remains,
+    # do not fall through to the host's ordinary Internet route.
+    ip -4 route replace blackhole default \
+        table "${AWG_TABLE}" metric 32767
+
+    ip -4 route replace default \
+        dev "${AWG_IF}" \
+        table "${AWG_TABLE}" \
+        metric 100
+
+    # Keep the guest subnet reachable via the bridge.
+    ip -4 route replace "${VM_CIDR}" \
+        dev "${VM_BRIDGE}" \
+        table "${AWG_TABLE}" \
+        scope link
+
+    # Source-based policy routing for guest traffic.
+    ip -4 rule add \
+        priority "${AWG_RULE_PRIO}" \
+        from "${VM_CIDR}" \
+        table "${AWG_TABLE}"
+}
+
+
+# ---------------------------------------------------------------------------
+# Firewall
+# ---------------------------------------------------------------------------
+
+remove_iptables_rules() {
+    ipt_delete_all FORWARD \
+        -i "${VM_BRIDGE}" \
+        -j "${FWD_CHAIN}"
+
+    ipt_delete_all FORWARD \
+        -o "${VM_BRIDGE}" \
+        -j "${FWD_CHAIN}"
+
+    ipt -F "${FWD_CHAIN}" 2>/dev/null || true
+    ipt -X "${FWD_CHAIN}" 2>/dev/null || true
+
+    ipt_delete_all -t nat POSTROUTING \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -j MASQUERADE
+
+    ipt_delete_all -t mangle FORWARD \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -p tcp \
+        --tcp-flags SYN,RST SYN \
+        -j TCPMSS \
+        --clamp-mss-to-pmtu
+
+    ipt_delete_all INPUT \
+        -i "${VM_BRIDGE}" \
+        -s "${VM_CIDR}" \
+        -p udp \
+        --dport 53 \
+        -j REJECT
+
+    ipt_delete_all INPUT \
+        -i "${VM_BRIDGE}" \
+        -s "${VM_CIDR}" \
+        -p tcp \
+        --dport 53 \
+        -j REJECT
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6t_delete_all FORWARD \
+            -i "${VM_BRIDGE}" \
+            -j "${V6_FWD_CHAIN}"
+
+        ip6t_delete_all FORWARD \
+            -o "${VM_BRIDGE}" \
+            -j "${V6_FWD_CHAIN}"
+
+        ip6t -F "${V6_FWD_CHAIN}" 2>/dev/null || true
+        ip6t -X "${V6_FWD_CHAIN}" 2>/dev/null || true
+    fi
+}
+
+
+install_iptables_rules() {
+    ipt -N "${FWD_CHAIN}" 2>/dev/null || ipt -F "${FWD_CHAIN}"
+
+    # Established replies from AmneziaWG back to guests.
+    ipt_append_once "${FWD_CHAIN}" \
+        -i "${AWG_IF}" \
+        -o "${VM_BRIDGE}" \
+        -d "${VM_CIDR}" \
+        -m conntrack \
+        --ctstate RELATED,ESTABLISHED \
+        -j ACCEPT
+
+    # Guest traffic may leave only through AmneziaWG.
+    ipt_append_once "${FWD_CHAIN}" \
+        -i "${VM_BRIDGE}" \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -j ACCEPT
+
+    # Kill switch.
+    ipt_append_once "${FWD_CHAIN}" \
+        -i "${VM_BRIDGE}" \
+        -s "${VM_CIDR}" \
+        -j REJECT \
+        --reject-with icmp-net-unreachable
+
+    # Never permit unsolicited VPN traffic into the guests.
+    ipt_append_once "${FWD_CHAIN}" \
+        -o "${VM_BRIDGE}" \
+        -d "${VM_CIDR}" \
+        -j REJECT \
+        --reject-with icmp-port-unreachable
+
+    ipt_insert_once FORWARD \
+        -i "${VM_BRIDGE}" \
+        -j "${FWD_CHAIN}"
+
+    ipt_insert_once FORWARD \
+        -o "${VM_BRIDGE}" \
+        -j "${FWD_CHAIN}"
+
+    # PAT guest traffic onto the AWG interface.
+    ipt_append_once -t nat POSTROUTING \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -j MASQUERADE
+
+    # Avoid TCP PMTU black holes.
+    ipt_append_once -t mangle FORWARD \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -p tcp \
+        --tcp-flags SYN,RST SYN \
+        -j TCPMSS \
+        --clamp-mss-to-pmtu
+
+    # Prevent DNS leaks to a resolver on the host.
+    if [[ "${BLOCK_HOST_DNS}" == "1" ]]; then
+        ipt_insert_once INPUT \
+            -i "${VM_BRIDGE}" \
+            -s "${VM_CIDR}" \
+            -p udp \
+            --dport 53 \
+            -j REJECT
+
+        ipt_insert_once INPUT \
+            -i "${VM_BRIDGE}" \
+            -s "${VM_CIDR}" \
+            -p tcp \
+            --dport 53 \
+            -j REJECT
+    fi
+
+    # IPv4-only VPN gateway: prevent guest IPv6 from bypassing the tunnel.
+    if [[ "${BLOCK_VM_IPV6}" == "1" ]] &&
+       command -v ip6tables >/dev/null 2>&1; then
+
+        ip6t -N "${V6_FWD_CHAIN}" 2>/dev/null || \
+            ip6t -F "${V6_FWD_CHAIN}"
+
+        ip6t -A "${V6_FWD_CHAIN}" \
+            -i "${VM_BRIDGE}" \
+            -j REJECT \
+            --reject-with icmp6-adm-prohibited
+
+        ip6t -A "${V6_FWD_CHAIN}" \
+            -o "${VM_BRIDGE}" \
+            -j REJECT \
+            --reject-with icmp6-adm-prohibited
+
+        ip6t_insert_once FORWARD \
+            -i "${VM_BRIDGE}" \
+            -j "${V6_FWD_CHAIN}"
+
+        ip6t_insert_once FORWARD \
+            -o "${VM_BRIDGE}" \
+            -j "${V6_FWD_CHAIN}"
+    fi
+}
+
+
+# ---------------------------------------------------------------------------
+# AmneziaWG lifecycle
+# ---------------------------------------------------------------------------
+
+validate_config() {
+    if [[ ! -r "${AWG_CONFIG}" ]]; then
+        echo >&2 "AmneziaWG config not readable: ${AWG_CONFIG}"
+        exit 3
+    fi
+
+    if ! awg_config_addresses | grep -q .; then
+        echo >&2 \
+            "No Address= line found in ${AWG_CONFIG}."
+        exit 5
+    fi
+
+    if ! grep -Eiq '^[[:space:]]*\[Interface\][[:space:]]*$' \
+        "${AWG_CONFIG}"; then
+        echo >&2 "Config has no [Interface] section."
+        exit 5
+    fi
+
+    if ! grep -Eiq '^[[:space:]]*\[Peer\][[:space:]]*$' \
+        "${AWG_CONFIG}"; then
+        echo >&2 "Config has no [Peer] section."
+        exit 5
+    fi
+}
+
+
+start_amneziawg() {
+    local log_level="${AWG_LOG_LEVEL}"
+    local deadline
+
+    if ! command -v amneziawg-go >/dev/null 2>&1; then
+        echo >&2 "Missing required command: amneziawg-go"
+        return 2
+    fi
+
+    [[ -e "${DEBUG_FILE}" ]] && log_level=debug
+
+    mkdir -p "$(dirname "${AWG_LOG_FILE}")" || return $?
+    (umask 077; touch "${AWG_LOG_FILE}") || return $?
+    chmod 600 "${AWG_LOG_FILE}" || return $?
+
+    echo "Starting amneziawg-go on ${AWG_IF} (log: ${AWG_LOG_FILE})..."
+
+    # The daemon appends WG_PROCESS_FOREGROUND=1 to its child's environment.
+    # An inherited value (even 0) shadows that flag and causes repeated forks.
+    # Its internal file-descriptor variables must also start unset.
+    if ! timeout --kill-after=2s "${AWG_START_TIMEOUT}s" \
+        env -u WG_PROCESS_FOREGROUND -u WG_TUN_FD -u WG_UAPI_FD \
+        LOG_LEVEL="${log_level}" amneziawg-go "${AWG_IF}" \
+        >>"${AWG_LOG_FILE}" 2>&1; then
+        echo >&2 "Could not start amneziawg-go; see ${AWG_LOG_FILE}."
+        return 1
+    fi
+
+    echo "Waiting for ${AWG_IF} to respond (up to ${AWG_START_TIMEOUT}s)..."
+
+    # Limit each socket read as well as the total readiness wait.
+    deadline=$((SECONDS + AWG_START_TIMEOUT))
+    while (( SECONDS < deadline )); do
+        if timeout --kill-after=1s 1s awg show "${AWG_IF}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    ip link del "${AWG_IF}" >/dev/null 2>&1 || true
+    echo >&2 "AmneziaWG interface did not become ready; see ${AWG_LOG_FILE}."
+    return 1
+}
+
+
+configure_amneziawg() {
+    local mtu addr
+
+    TMP_AWG_CONF="$(mktemp)" || return $?
+    chmod 600 "${TMP_AWG_CONF}" || return $?
+
+    write_awg_setconf_file "${TMP_AWG_CONF}" || return $?
+
+    if ! ip link show "${AWG_IF}" >/dev/null 2>&1; then
+        start_amneziawg || return $?
+        echo "Applying AmneziaWG configuration (including endpoint DNS resolution)..."
+        if ! awg setconf "${AWG_IF}" "${TMP_AWG_CONF}"; then
+            ip link del "${AWG_IF}" >/dev/null 2>&1 || true
+            return 1
+        fi
+    else
+        echo "Checking existing AmneziaWG interface ${AWG_IF}..."
+        if ! awg show "${AWG_IF}" >/dev/null 2>&1; then
+            echo >&2 "Existing interface ${AWG_IF} is not responding to awg."
+            echo >&2 "If a previous startup hung, run $0 down and retry up."
+            return 1
+        fi
+        # syncconf avoids destroying working peer sessions unnecessarily.
+        echo "Updating AmneziaWG configuration (including endpoint DNS resolution)..."
+        awg syncconf "${AWG_IF}" "${TMP_AWG_CONF}" || return $?
+    fi
+
+    echo "Configuring tunnel addresses and MTU..."
+    ip address flush dev "${AWG_IF}" scope global >/dev/null 2>&1 || true
+
+    mtu="$(awg_config_mtu || true)"
+
+    if [[ -n "${mtu}" ]]; then
+        ip link set mtu "${mtu}" dev "${AWG_IF}" || return $?
+    else
+        ip link set mtu 1420 dev "${AWG_IF}" || return $?
+    fi
+
+    while IFS= read -r addr; do
+        if [[ -n "${addr}" ]]; then
+            ip address add "${addr}" dev "${AWG_IF}" || return $?
+        fi
+    done < <(awg_config_addresses)
+
+    ip link set "${AWG_IF}" up
+}
+
+
+configure_sysctls() {
+    save_sysctls
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    # Needed for asymmetric/policy-routed traffic on this gateway.
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+
+    sysctl -w "net.ipv4.conf.${AWG_IF}.rp_filter=0" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv4.conf.${VM_BRIDGE}.rp_filter=0" >/dev/null 2>&1 || true
+}
+
+
+up() {
+    require_root
+    require_cmds
+    echo "Preparing VM AmneziaWG gateway using ${AWG_CONFIG}..."
+    validate_config
+
+    if ! ip link show "${VM_BRIDGE}" >/dev/null 2>&1; then
+        echo >&2 \
+            "VM bridge ${VM_BRIDGE} does not exist."
+        echo >&2 \
+            "Run virtstart first."
+        exit 4
+    fi
+
+    configure_amneziawg || return $?
+    echo "Enabling VM forwarding..."
+    configure_sysctls
+
+    echo "Installing VM policy routing..."
+    remove_policy_routing
+    install_policy_routing
+
+    echo "Installing VM PAT and firewall rules (lock wait: 5s per command)..."
+    install_iptables_rules
+
+    echo
+    echo "VM AmneziaWG gateway is up."
+    echo "  VM subnet:    ${VM_CIDR}"
+    echo "  VM bridge:    ${VM_BRIDGE}"
+    echo "  AWG interface: ${AWG_IF}"
+    echo "  AWG table:     ${AWG_TABLE}"
+    echo "  Rule priority:${AWG_RULE_PRIO}"
+    echo "  AWG config:    ${AWG_CONFIG}"
+    echo "  Daemon log:    ${AWG_LOG_FILE}"
+    echo
+    echo "Run:"
+    echo "  sudo $0 check"
+}
+
+
+down() {
+    require_root
+    require_cmds
+
+    remove_iptables_rules
+    remove_policy_routing
+
+    ip link del "${AWG_IF}" >/dev/null 2>&1 || true
+
+    restore_sysctls
+
+    echo "VM AmneziaWG gateway is down."
+}
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+show_awg_summary() {
+    if ! ip link show "${AWG_IF}" >/dev/null 2>&1; then
+        echo "${AWG_IF}: DOWN"
+        return 1
+    fi
+
+    awg show "${AWG_IF}"
+}
+
+
+show_peer_summary() {
+    local now
+    now="$(date +%s)"
+
+    echo "AmneziaWG peers: $(peer_count)"
+
+    # IMPORTANT:
+    # awg show <interface> dump columns are:
+    #
+    #   public-key
+    #   preshared-key
+    #   endpoint
+    #   allowed-ips
+    #   latest-handshake
+    #   rx-bytes
+    #   tx-bytes
+    #   persistent-keepalive
+    #
+    while IFS=$'\t' read -r pub psk endpoint allowed hs rx tx keep; do
+        [[ -n "${pub}" ]] || continue
+
+        local age="never"
+
+        if [[ "${hs}" =~ ^[0-9]+$ ]] && (( hs > 0 )); then
+            age="$(format_age "$((now - hs))")"
+        fi
+
+        printf '  peer %s\n' "${pub}"
+        printf '    endpoint: %s\n' "${endpoint:-none}"
+        printf '    handshake: %s\n' "${age}"
+        printf '    rx: %s bytes\n' "${rx:-0}"
+        printf '    tx: %s bytes\n' "${tx:-0}"
+        printf '    keepalive: %ss\n' "${keep:-0}"
+        printf '    allowed IPs: %s\n' "${allowed:-none}"
+    done < <(
+        awg show "${AWG_IF}" dump 2>/dev/null |
+            tail -n +2
+    )
+}
+
+
+show_firewall_counters() {
+    echo
+    echo "=== FORWARD counters ==="
+
+    ipt -nvx -L "${FWD_CHAIN}" 2>/dev/null ||
+        echo "${FWD_CHAIN} does not exist."
+
+    echo
+    echo "=== NAT counters ==="
+
+    ipt -t nat -nvx -L POSTROUTING 2>/dev/null |
+        grep -E "${VM_CIDR}|VMAWG|MASQUERADE" ||
+        true
+
+    echo
+    echo "=== MSS counters ==="
+
+    ipt -t mangle -nvx -L FORWARD 2>/dev/null |
+        grep -E "${VM_CIDR}|TCPMSS|${AWG_IF}" ||
+        true
+}
+
+
+status() {
+    require_root
+    require_cmds
+
+    echo "========================================"
+    echo " VM AmneziaWG Gateway"
+    echo "========================================"
+    echo
+
+    echo "Bridge:"
+    ip -br addr show dev "${VM_BRIDGE}" 2>/dev/null || true
+
+    echo
+    echo "AmneziaWG:"
+    if ip link show "${AWG_IF}" >/dev/null 2>&1; then
+        ip -br addr show dev "${AWG_IF}"
+        awg show "${AWG_IF}"
+    else
+        echo "${AWG_IF}: DOWN"
+    fi
+
+    echo
+    echo "Policy rule:"
+    ip -4 rule show |
+        grep -F "from ${VM_CIDR}" ||
+        echo "MISSING"
+
+    echo
+    echo "Routing table ${AWG_TABLE}:"
+    ip -4 route show table "${AWG_TABLE}" || true
+
+    echo
+    echo "Route decision:"
+    local bridge_ip
+    bridge_ip="$(get_bridge_ip || true)"
+
+    if [[ -n "${bridge_ip}" ]]; then
+        ip -4 route get "${CHECK_IP}" from "${bridge_ip}" || true
+    else
+        echo "Cannot determine bridge IPv4 address."
+    fi
+
+    echo
+    echo "Forwarding:"
+    show_firewall_counters
+
+    echo
+    echo "Sysctls:"
+    sysctl \
+        net.ipv4.ip_forward \
+        net.ipv4.conf.all.rp_filter \
+        net.ipv4.conf.default.rp_filter \
+        2>/dev/null || true
+
+    echo
+    echo "Endpoint:"
+    echo "  configured: $(awg_config_endpoint 2>/dev/null || true)"
+    echo "  runtime:    $(get_endpoint_runtime || true)"
+
+    echo
+    echo "Peer summary:"
+    show_peer_summary
+}
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+check_interface() {
+    if ip link show "${VM_BRIDGE}" >/dev/null 2>&1; then
+        print_ok "VM bridge ${VM_BRIDGE} exists"
+    else
+        print_fail "VM bridge ${VM_BRIDGE} does not exist"
+        return
+    fi
+
+    if ip link show "${AWG_IF}" >/dev/null 2>&1; then
+        print_ok "AmneziaWG interface ${AWG_IF} exists"
+    else
+        print_fail "AmneziaWG interface ${AWG_IF} does not exist"
+        return
+    fi
+
+    if ip link show "${AWG_IF}" | grep -q 'UP'; then
+        print_ok "AmneziaWG interface is UP"
+    else
+        print_fail "AmneziaWG interface is DOWN"
+    fi
+
+    if ip -4 addr show dev "${AWG_IF}" scope global | grep -q 'inet '; then
+        print_ok "AmneziaWG has an IPv4 address"
+    else
+        print_fail "AmneziaWG has no IPv4 address"
+    fi
+}
+
+
+check_policy() {
+    local rule
+    local routes
+
+    rule="$(ip -4 rule show |
+        grep -F "from ${VM_CIDR}" |
+        grep -F "lookup ${AWG_TABLE}" |
+        head -n 1 || true)"
+
+    if [[ -n "${rule}" ]]; then
+        print_ok \
+            "Policy rule ${AWG_RULE_PRIO}: ${VM_CIDR} -> table ${AWG_TABLE}"
+    else
+        print_fail \
+            "Missing policy rule: from ${VM_CIDR} lookup ${AWG_TABLE}"
+    fi
+
+    routes="$(ip -4 route show table "${AWG_TABLE}" 2>/dev/null || true)"
+
+    if grep -Eq '^default .*dev '"${AWG_IF}"'' <<<"${routes}"; then
+        print_ok "Policy table has default route via ${AWG_IF}"
+    else
+        print_fail \
+            "Policy table has no default route via ${AWG_IF}"
+    fi
+
+    if grep -Fq "${VM_CIDR} dev ${VM_BRIDGE}" <<<"${routes}"; then
+        print_ok \
+            "Policy table has connected route ${VM_CIDR} via ${VM_BRIDGE}"
+    else
+        print_fail \
+            "Policy table is missing connected VM route"
+    fi
+
+    if grep -Eq '^blackhole default' <<<"${routes}"; then
+        print_ok "Policy table has blackhole fallback"
+    else
+        print_fail "Policy table has no blackhole fallback"
+    fi
+}
+
+
+check_endpoint() {
+    local configured runtime endpoint_ip route
+
+    configured="$(awg_config_endpoint 2>/dev/null || true)"
+    runtime="$(get_endpoint_runtime || true)"
+
+    # A static Endpoint= is useful, but absence of one is not inherently a
+    # failure. AmneziaWG can have a learned runtime endpoint.
+    if [[ -n "${configured}" ]]; then
+        print_ok "AmneziaWG static endpoint configured: ${configured}"
+    else
+        print_warn \
+            "No static Endpoint= found in AmneziaWG config"
+    fi
+
+    if [[ -z "${runtime}" ]]; then
+        print_fail \
+            "AmneziaWG currently has no runtime endpoint"
+        return
+    fi
+
+    print_ok "AmneziaWG runtime endpoint: ${runtime}"
+
+    endpoint_ip="$(endpoint_ip "${runtime}" || true)"
+
+    if [[ -z "${endpoint_ip}" ]]; then
+        print_fail \
+            "Could not resolve endpoint IPv4 address: ${runtime}"
+        return
+    fi
+
+    echo "      endpoint IPv4: ${endpoint_ip}"
+
+    if route="$(ip -4 route get "${endpoint_ip}" 2>&1)"; then
+        print_ok "Host has a route to AmneziaWG endpoint"
+        echo "      ${route}"
+    else
+        print_fail \
+            "Host cannot route to AmneziaWG endpoint ${endpoint_ip}"
+        echo "      ${route}"
+        return
+    fi
+
+    # The AmneziaWG endpoint itself must not be sent into awg-vm.
+    if grep -q "dev ${AWG_IF}" <<<"${route}"; then
+        print_fail \
+            "AmneziaWG endpoint itself routes through ${AWG_IF} (routing loop)"
+    else
+        print_ok \
+            "AmneziaWG endpoint is not routed through ${AWG_IF}"
+    fi
+}
+
+
+check_handshake() {
+    local now max_age peers
+
+    now="$(date +%s)"
+    peers="$(peer_count)"
+
+    if (( peers == 0 )); then
+        print_fail "AmneziaWG has no peers"
+        return
+    fi
+
+    max_age="$(max_handshake_age "${now}")"
+
+    if (( max_age < 0 )); then
+        print_fail \
+            "AmneziaWG peer has NEVER completed a handshake"
+
+        echo
+        echo "Likely causes:"
+        echo "  - VPN endpoint unreachable"
+        echo "  - UDP blocked"
+        echo "  - wrong keys"
+        echo "  - obfuscation parameters do not match the server"
+        echo "  - wrong endpoint"
+        echo "  - AmneziaWG server unavailable"
+        echo "  - host route to endpoint broken"
+
+        return
+    fi
+
+    echo "      oldest peer handshake age: $(format_age "${max_age}")"
+
+    if (( max_age <= HANDSHAKE_MAX_AGE )); then
+        print_ok \
+            "AmneziaWG has a recent handshake (${max_age}s <= ${HANDSHAKE_MAX_AGE}s)"
+    else
+        print_fail \
+            "AmneziaWG handshake is stale (${max_age}s > ${HANDSHAKE_MAX_AGE}s)"
+
+        echo
+        echo "This means the host can have a configured tunnel but currently"
+        echo "has no evidence of a recent authenticated exchange."
+    fi
+
+    echo
+    echo "      Peer runtime:"
+    show_peer_summary
+}
+
+
+check_firewall() {
+    if ipt -S "${FWD_CHAIN}" >/dev/null 2>&1; then
+        print_ok "Forwarding chain ${FWD_CHAIN} exists"
+    else
+        print_fail "Forwarding chain ${FWD_CHAIN} does not exist"
+    fi
+
+    if ipt -C FORWARD \
+        -i "${VM_BRIDGE}" \
+        -j "${FWD_CHAIN}" 2>/dev/null; then
+        print_ok "VM ingress forwarding hook exists"
+    else
+        print_fail "VM ingress forwarding hook is missing"
+    fi
+
+    if ipt -C FORWARD \
+        -o "${VM_BRIDGE}" \
+        -j "${FWD_CHAIN}" 2>/dev/null; then
+        print_ok "VM egress forwarding hook exists"
+    else
+        print_fail "VM egress forwarding hook is missing"
+    fi
+
+    if ipt -C "${FWD_CHAIN}" \
+        -i "${VM_BRIDGE}" \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -j ACCEPT 2>/dev/null; then
+        print_ok "VM -> AmneziaWG forwarding rule exists"
+    else
+        print_fail "VM -> AmneziaWG forwarding rule is missing"
+    fi
+
+    if ipt -C "${FWD_CHAIN}" \
+        -i "${VM_BRIDGE}" \
+        -s "${VM_CIDR}" \
+        -j REJECT \
+        --reject-with icmp-net-unreachable 2>/dev/null; then
+        print_ok "VM kill switch is enabled"
+    else
+        print_fail "VM kill switch rule is missing"
+    fi
+
+    if ipt -t nat -C POSTROUTING \
+        -s "${VM_CIDR}" \
+        -o "${AWG_IF}" \
+        -j MASQUERADE 2>/dev/null; then
+        print_ok "VM NAT/MASQUERADE rule exists"
+    else
+        print_fail "VM NAT/MASQUERADE rule is missing"
+    fi
+
+    if [[ "${BLOCK_HOST_DNS}" == "1" ]]; then
+        if ipt -C INPUT \
+            -i "${VM_BRIDGE}" \
+            -s "${VM_CIDR}" \
+            -p udp \
+            --dport 53 \
+            -j REJECT 2>/dev/null; then
+            print_ok "Host DNS leak protection is enabled"
+        else
+            print_fail "Host UDP/53 DNS leak protection is missing"
+        fi
+    fi
+
+    if [[ "${BLOCK_VM_IPV6}" == "1" ]]; then
+        if command -v ip6tables >/dev/null 2>&1; then
+            if ip6t -C FORWARD \
+                -i "${VM_BRIDGE}" \
+                -j "${V6_FWD_CHAIN}" 2>/dev/null; then
+                print_ok "VM IPv6 kill switch is enabled"
+            else
+                print_fail "VM IPv6 kill switch is missing"
+            fi
+        else
+            print_warn \
+                "ip6tables is unavailable; cannot enforce IPv6 kill switch"
+        fi
+    fi
+}
+
+
+check_host_internet() {
+    if ping -4 -c 1 -W 2 "${CHECK_IP}" >/dev/null 2>&1; then
+        print_ok "Host -> ${CHECK_IP}"
+    else
+        print_fail \
+            "Host cannot reach ${CHECK_IP}; fix host Internet before debugging AWG"
+    fi
+}
+
+
+check_source_route() {
+    local bridge_ip route
+
+    bridge_ip="$(get_bridge_ip || true)"
+
+    if [[ -z "${bridge_ip}" ]]; then
+        print_fail "Cannot determine IPv4 address of ${VM_BRIDGE}"
+        return
+    fi
+
+    echo "      VM/bridge source address: ${bridge_ip}"
+
+    if ! route="$(ip -4 route get "${CHECK_IP}" from "${bridge_ip}" 2>&1)"; then
+        print_fail \
+            "Kernel cannot route ${CHECK_IP} from ${bridge_ip}"
+        echo "      ${route}"
+        return
+    fi
+
+    echo "      ${route}"
+
+    if grep -q "dev ${AWG_IF}" <<<"${route}"; then
+        print_ok \
+            "${CHECK_IP} from ${bridge_ip} routes through ${AWG_IF}"
+    else
+        print_fail \
+            "${CHECK_IP} from ${bridge_ip} does NOT route through ${AWG_IF}"
+
+        echo
+        echo "This is a policy-routing problem."
+        echo "Expected:"
+        echo "  ${CHECK_IP} dev ${AWG_IF} ..."
+        echo "Actual:"
+        echo "  ${route}"
+    fi
+}
+
+
+check_active_path() {
+    local bridge_ip before_rx before_tx after_rx after_tx
+    local ping_rc=0
+
+    bridge_ip="$(get_bridge_ip || true)"
+
+    if [[ -z "${bridge_ip}" ]]; then
+        print_fail "Cannot perform active source-path test"
+        return
+    fi
+
+    before_rx="$(sum_awg_transfer 6)"
+    before_tx="$(sum_awg_transfer 7)"
+
+    TMP_PING="$(mktemp /tmp/vm-awg-pat-ping.XXXXXX)"
+
+    echo
+    echo "      Sending traffic with source ${bridge_ip}..."
+    echo "      ping -4 -I ${bridge_ip} -c 2 -W 2 ${CHECK_IP}"
+
+    if ping -4 \
+        -I "${bridge_ip}" \
+        -c 2 \
+        -W 2 \
+        "${CHECK_IP}" >"${TMP_PING}" 2>&1; then
+
+        cat "${TMP_PING}"
+
+        print_ok \
+            "Active Internet path through ${AWG_IF}"
+    else
+        ping_rc=$?
+
+        cat "${TMP_PING}"
+
+        print_fail \
+            "Active Internet path through ${AWG_IF} FAILED"
+
+        echo
+        echo "      ping exit status: ${ping_rc}"
+    fi
+
+    rm -f "${TMP_PING}"
+    TMP_PING=""
+
+    after_rx="$(sum_awg_transfer 6)"
+    after_tx="$(sum_awg_transfer 7)"
+
+    echo
+    echo "      AmneziaWG transfer delta:"
+    echo "        RX: $((after_rx - before_rx)) bytes"
+    echo "        TX: $((after_tx - before_tx)) bytes"
+
+    if (( after_tx > before_tx )); then
+        print_ok "AmneziaWG transmitted packets during test"
+    else
+        print_fail \
+            "AmneziaWG TX did not increase during active test"
+    fi
+
+    if (( after_rx > before_rx )); then
+        print_ok "AmneziaWG received packets during test"
+    else
+        print_warn \
+            "AmneziaWG RX did not increase during active test"
+        echo "      Possible return-path/server/NAT/firewall problem."
+    fi
+}
+
+
+check_dns() {
+    if ! command -v getent >/dev/null 2>&1; then
+        print_warn "getent unavailable; skipping DNS test"
+        return
+    fi
+
+    if getent ahostsv4 "${CHECK_HOST}" >/dev/null 2>&1; then
+        print_ok "Host DNS resolution: ${CHECK_HOST}"
+    else
+        print_fail "Host DNS resolution failed: ${CHECK_HOST}"
+    fi
+}
+
+
+check_counters() {
+    echo
+    echo "=== Packet counters ==="
+
+    ipt -nvx -L "${FWD_CHAIN}" 2>/dev/null || true
+
+    echo
+    echo "=== NAT counters ==="
+
+    ipt -t nat -nvx -L POSTROUTING 2>/dev/null |
+        grep -E "${VM_CIDR}|MASQUERADE" ||
+        true
+}
+
+
+check() {
+    require_root
+    require_cmds
+
+    FAILURES=0
+
+    echo
+    echo "========================================"
+    echo " VM AmneziaWG health check"
+    echo "========================================"
+    echo
+
+    echo "Configuration:"
+    echo "  bridge:       ${VM_BRIDGE}"
+    echo "  VM CIDR:      ${VM_CIDR}"
+    echo "  AWG interface: ${AWG_IF}"
+    echo "  AWG table:     ${AWG_TABLE}"
+    echo "  rule priority:${AWG_RULE_PRIO}"
+    echo "  config:       ${AWG_CONFIG}"
+    echo "  check IP:     ${CHECK_IP}"
+    echo
+
+    echo "=== Interface ==="
+    check_interface
+
+    echo
+    echo "=== Policy routing ==="
+    check_policy
+
+    echo
+    echo "=== AmneziaWG endpoint ==="
+    check_endpoint
+
+    echo
+    echo "=== AmneziaWG handshake ==="
+    check_handshake
+
+    echo
+    echo "=== Firewall ==="
+    check_firewall
+
+    echo
+    echo "=== Host connectivity ==="
+    check_host_internet
+
+    echo
+    echo "=== Source-specific routing ==="
+    check_source_route
+
+    echo
+    echo "=== Active tunnel connectivity ==="
+    check_active_path
+
+    echo
+    echo "=== DNS ==="
+    check_dns
+
+    echo
+    check_counters
+
+    echo
+    echo "========================================"
+
+    if (( FAILURES == 0 )); then
+        echo "$(green "RESULT: HEALTHY")"
+        echo "========================================"
+        return 0
+    fi
+
+    echo "$(red "RESULT: FAILED (${FAILURES} check(s))")"
+    echo "========================================"
+
+    echo
+    echo "Diagnostic interpretation:"
+
+    local hs_age
+    hs_age="$(max_handshake_age "$(date +%s)")"
+
+    if (( hs_age < 0 )); then
+        echo "  * No AmneziaWG handshake exists."
+        echo "    Investigate endpoint reachability, UDP, keys and server."
+    elif (( hs_age > HANDSHAKE_MAX_AGE )); then
+        echo "  * AmneziaWG handshake is stale."
+        echo "    The tunnel itself is probably the first thing to investigate."
+    else
+        echo "  * AmneziaWG has a recent handshake."
+        echo "    If Internet still fails, inspect:"
+        echo "      - server-side forwarding"
+        echo "      - server-side NAT"
+        echo "      - server-side firewall"
+        echo "      - server peer AllowedIPs"
+        echo "      - return routing"
+        echo "      - MTU"
+    fi
+
+    echo
+    echo "Useful commands:"
+    echo "  $0 status"
+    echo "  $0 dump"
+    echo "  $0 trace"
+
+    return 1
+}
+
+
+# ---------------------------------------------------------------------------
+# Repair/watch
+# ---------------------------------------------------------------------------
+
+repair() {
+    require_root
+    require_cmds
+
+    echo "Reapplying VM AmneziaWG gateway configuration..."
+
+    up || return $?
+
+    echo
+    echo "Running health check..."
+    echo
+
+    if check; then
+        echo
+        echo "$(green "Repair succeeded.")"
+        return 0
+    fi
+
+    echo
+    echo "$(red "Repair completed, but the tunnel is still unhealthy.")"
+    echo
+    echo "Do NOT keep repeatedly restarting it."
+    echo "Run:"
+    echo "  $0 dump"
+    echo "  $0 trace"
+
+    return 1
+}
+
+
+watch() {
+    require_root
+    require_cmds
+
+    local failures=0
+    local watch_tmp
+
+    watch_tmp="$(mktemp /tmp/vm-awg-pat-watch.XXXXXX)"
+
+    trap 'rm -f "${watch_tmp}"' RETURN
+
+    echo "Watching VM AmneziaWG gateway."
+    echo "  interval: ${WATCH_INTERVAL}s"
+    echo "  repair after: ${WATCH_FAILURES} consecutive failures"
+    echo
+    echo "Press Ctrl-C to stop."
+    echo
+
+    while true; do
+        if check >"${watch_tmp}" 2>&1; then
+            failures=0
+
+            echo
+            echo "[$(date '+%F %T')] HEALTHY"
+            echo
+
+        else
+            failures=$((failures + 1))
+
+            echo
+            echo "[$(date '+%F %T')] FAILED (${failures}/${WATCH_FAILURES})"
+            echo
+            cat "${watch_tmp}"
+
+            if (( failures >= WATCH_FAILURES )); then
+                echo
+                echo "[$(date '+%F %T')] Attempting automatic repair..."
+                echo
+
+                if repair; then
+                    echo
+                    echo "[$(date '+%F %T')] RECOVERED"
+                    failures=0
+                else
+                    echo
+                    echo "[$(date '+%F %T')] Repair failed"
+                fi
+            fi
+        fi
+
+        sleep "${WATCH_INTERVAL}"
+    done
+}
+
+
+# ---------------------------------------------------------------------------
+# MTU
+# ---------------------------------------------------------------------------
+
+mtu_test() {
+    require_root
+    require_cmds
+
+    local bridge_ip size last_ok=0
+
+    bridge_ip="$(get_bridge_ip || true)"
+
+    if [[ -z "${bridge_ip}" ]]; then
+        echo >&2 "Cannot determine bridge IPv4 address."
+        return 1
+    fi
+
+    echo "Testing path MTU through ${AWG_IF}"
+    echo "Source: ${bridge_ip}"
+    echo "Target: ${CHECK_IP}"
+    echo
+
+    # ping payload + 28 bytes IPv4/ICMP header = actual packet size.
+    for size in 1400 1380 1360 1340 1320 1300 1280; do
+        printf '  payload %-4s (%-4s byte IP packet): ' \
+            "${size}" "$((size + 28))"
+
+        if ping -4 \
+            -I "${bridge_ip}" \
+            -M do \
+            -s "${size}" \
+            -c 1 \
+            -W 2 \
+            "${CHECK_IP}" >/dev/null 2>&1; then
+
+            echo "$(green OK)"
+            last_ok="${size}"
+        else
+            echo "$(red FAIL)"
+        fi
+    done
+
+    echo
+
+    if (( last_ok > 0 )); then
+        echo "Largest tested working ICMP payload: ${last_ok}"
+        echo "Approximate working IPv4 packet size: $((last_ok + 28))"
+    else
+        echo "No tested packet size succeeded."
+        echo "This may be a tunnel/connectivity problem rather than MTU."
+        return 1
+    fi
+}
+
+
+# ---------------------------------------------------------------------------
+# Trace
+# ---------------------------------------------------------------------------
+
+trace() {
+    require_root
+    require_cmds
+
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        echo >&2 "tcpdump is required for trace."
+        exit 2
+    fi
+
+    local endpoint port filter
+
+    endpoint="$(get_endpoint_runtime || true)"
+    port=""
+
+    if [[ -n "${endpoint}" ]]; then
+        port="$(endpoint_port "${endpoint}" || true)"
+    fi
+
+    filter="net ${VM_CIDR}"
+
+    if [[ "${port}" =~ ^[0-9]+$ ]]; then
+        filter="${filter} or udp port ${port}"
+    else
+        filter="${filter} or udp"
+    fi
+
+    echo "Capturing VM/AmneziaWG traffic."
+    echo
+    echo "Filter:"
+    echo "  ${filter}"
+    echo
+    echo "Useful things to look for:"
+    echo "  VM packet enters virbr10"
+    echo "  encrypted UDP leaves host"
+    echo "  encrypted UDP returns"
+    echo "  VM reply leaves virbr10"
+    echo
+    echo "Press Ctrl-C to stop."
+    echo
+
+    tcpdump -ni any "${filter}"
+}
+
+
+# ---------------------------------------------------------------------------
+# Debug
+# ---------------------------------------------------------------------------
+
+debug() {
+    require_root
+
+    local action="${1:-}"
+
+    case "${action}" in
+        on)
+            mkdir -p "$(dirname "${DEBUG_FILE}")"
+            (umask 077; touch "${DEBUG_FILE}")
+            chmod 600 "${DEBUG_FILE}"
+            echo "amneziawg-go debug logging enabled for the next tunnel start."
+            ;;
+
+        off)
+            rm -f "${DEBUG_FILE}"
+            echo "Next tunnel start will use VM_AWG_LOG_LEVEL=${AWG_LOG_LEVEL}."
+            ;;
+
+        *)
+            echo >&2 "Usage: $0 debug on|off"
+            exit 64
+            ;;
+    esac
+
+    echo "For an existing tunnel, run down and then up to apply the log level."
+    echo "Log file: ${AWG_LOG_FILE}"
+    echo "Watch with: tail -f '${AWG_LOG_FILE}'"
+}
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic bundle
+# ---------------------------------------------------------------------------
+
+dump() {
+    require_root
+    require_cmds
+
+    echo "============================================================"
+    echo "VM-AWG-PAT DIAGNOSTIC DUMP"
+    echo "============================================================"
+    echo
+    echo "Generated: $(date --iso-8601=seconds)"
+    echo "Hostname:  $(hostname)"
+    echo
+    echo "Configuration:"
+    echo "  VM_BRIDGE=${VM_BRIDGE}"
+    echo "  VM_CIDR=${VM_CIDR}"
+    echo "  AWG_IF=${AWG_IF}"
+    echo "  AWG_TABLE=${AWG_TABLE}"
+    echo "  AWG_RULE_PRIO=${AWG_RULE_PRIO}"
+    echo "  AWG_CONFIG=${AWG_CONFIG}"
+    echo
+    echo "------------------------------------------------------------"
+    echo "Interfaces"
+    echo "------------------------------------------------------------"
+    ip -br addr show "${VM_BRIDGE}" 2>/dev/null || true
+    ip -br addr show "${AWG_IF}" 2>/dev/null || true
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "AmneziaWG"
+    echo "------------------------------------------------------------"
+    awg show "${AWG_IF}" 2>/dev/null || true
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "AmneziaWG dump"
+    echo "------------------------------------------------------------"
+    awg show "${AWG_IF}" dump 2>/dev/null || true
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Policy rules"
+    echo "------------------------------------------------------------"
+    ip -4 rule show
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "AWG routing table"
+    echo "------------------------------------------------------------"
+    ip -4 route show table "${AWG_TABLE}" 2>/dev/null || true
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Main routing table"
+    echo "------------------------------------------------------------"
+    ip -4 route show table main
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Endpoint route"
+    echo "------------------------------------------------------------"
+
+    local endpoint endpoint_ip
+
+    endpoint="$(get_endpoint_runtime || true)"
+
+    if [[ -n "${endpoint}" ]]; then
+        endpoint_ip="$(endpoint_ip "${endpoint}" || true)"
+
+        echo "Runtime endpoint: ${endpoint}"
+        echo "Endpoint IPv4:    ${endpoint_ip}"
+
+        if [[ -n "${endpoint_ip}" ]]; then
+            ip -4 route get "${endpoint_ip}" || true
+        fi
+    else
+        echo "No runtime endpoint."
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Firewall rules"
+    echo "------------------------------------------------------------"
+    ipt -S "${FWD_CHAIN}" 2>/dev/null || true
+    ipt -t nat -S POSTROUTING 2>/dev/null |
+        grep -E "${VM_CIDR}|${AWG_IF}|MASQUERADE" ||
+        true
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Firewall counters"
+    echo "------------------------------------------------------------"
+    ipt -nvx -L "${FWD_CHAIN}" 2>/dev/null || true
+    ipt -t nat -nvx -L POSTROUTING 2>/dev/null |
+        grep -E "${VM_CIDR}|${AWG_IF}|MASQUERADE" ||
+        true
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Sysctls"
+    echo "------------------------------------------------------------"
+    sysctl \
+        net.ipv4.ip_forward \
+        net.ipv4.conf.all.rp_filter \
+        net.ipv4.conf.default.rp_filter \
+        2>/dev/null || true
+
+    if [[ -e "/proc/sys/net/ipv4/conf/${VM_BRIDGE}/rp_filter" ]]; then
+        sysctl \
+            "net.ipv4.conf.${VM_BRIDGE}.rp_filter" \
+            2>/dev/null || true
+    fi
+
+    if [[ -e "/proc/sys/net/ipv4/conf/${AWG_IF}/rp_filter" ]]; then
+        sysctl \
+            "net.ipv4.conf.${AWG_IF}.rp_filter" \
+            2>/dev/null || true
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Route tests"
+    echo "------------------------------------------------------------"
+
+    local bridge_ip
+    bridge_ip="$(get_bridge_ip || true)"
+
+    if [[ -n "${bridge_ip}" ]]; then
+        echo "Source: ${bridge_ip}"
+        ip -4 route get "${CHECK_IP}" from "${bridge_ip}" || true
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "Kernel / AmneziaWG userspace"
+    echo "------------------------------------------------------------"
+    uname -a
+    awg --version 2>/dev/null || true
+    if command -v amneziawg-go >/dev/null 2>&1; then
+        amneziawg-go --version 2>/dev/null || true
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "amneziawg-go log (last 50 lines)"
+    echo "------------------------------------------------------------"
+    tail -n 50 "${AWG_LOG_FILE}" 2>/dev/null || true
+
+    echo
+    echo "============================================================"
+    echo "END DIAGNOSTIC DUMP"
+    echo "============================================================"
+}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    local action="${1:-}"
+
+    case "${action}" in
+        up|start|enable)
+            if [[ $# -ge 2 ]]; then
+                AWG_CONFIG="$2"
+            fi
+            up
+            ;;
+
+        down|stop|disable)
+            down
+            ;;
+
+        status)
+            status
+            ;;
+
+        check)
+            check
+            ;;
+
+        repair)
+            repair
+            ;;
+
+        watch)
+            watch
+            ;;
+
+        trace)
+            trace
+            ;;
+
+        mtu-test)
+            mtu_test
+            ;;
+
+        dump)
+            dump
+            ;;
+
+        debug)
+            debug "${2:-}"
+            ;;
+
+        -h|--help|help|"")
+            usage
+            ;;
+
+        *)
+            usage
+            exit 64
+            ;;
+    esac
+}
+
+
+main "$@"

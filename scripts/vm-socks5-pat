@@ -1,0 +1,884 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Route the KVM guest subnet through xjasonlyu/tun2socks and a SOCKS5 proxy.
+# Host default routes and DNS are left alone. Configure external DNS in the VM.
+# Requires Linux, tun2socks v2, iproute2, iptables, Python 3, and ip6tables
+# (unless BLOCK_VM_IPV6=0). check/repair/watch also require curl.
+#
+#   sudo ./vm-socks5-pat up socks5://127.0.0.1:1080
+#   sudo ./vm-socks5-pat up /path/to/private-proxy-url.txt
+#   sudo ./vm-socks5-pat down|status|check|repair|watch|trace|dump
+#   sudo ./vm-socks5-pat debug on|off
+#
+# The proxy URL file contains one socks5://[user:password@]host:port URL.
+# Percent-encode special characters in credentials. Use a private URL file to
+# keep credentials out of shell history and the invoking command's arguments.
+# The daemon receives credentials through a root-only config, never its argv.
+#
+# SOCKS5 transports TCP and UDP, not arbitrary IP protocols such as ICMP.
+# UDP (including ordinary DNS/QUIC) requires the proxy's UDP ASSOCIATE support;
+# ssh -D and many HTTP-oriented proxies only support TCP. Unsupported protocols
+# are rejected, never sent directly. IPv6 and host DNS are blocked by default.
+#
+# Startup failure retains the kill switch. down restores ordinary VM routing.
+# Settings are saved for later commands. down before changing bridge/subnet/
+# interface/table settings, or switching from another vm-*-pat gateway.
+# References: https://github.com/xjasonlyu/tun2socks/wiki/Examples
+#             https://github.com/xjasonlyu/tun2socks/blob/main/engine/key.go
+
+VM_BRIDGE="${VM_BRIDGE:-virbr10}"
+VM_CIDR="${VM_CIDR:-192.168.23.0/24}"
+SOCKS_IF="${SOCKS_IF:-tun-vmsocks}"
+SOCKS_ADDR="${SOCKS_ADDR:-198.18.0.1/32}"
+SOCKS_MTU="${SOCKS_MTU:-1500}"
+SOCKS_TABLE="${SOCKS_TABLE:-51826}"
+SOCKS_RULE_PRIO="${SOCKS_RULE_PRIO:-1003}"
+SOCKS5_PROXY="${SOCKS5_PROXY:-}"
+SOCKS5_PROXY_FILE="${SOCKS5_PROXY_FILE:-}"
+TUN2SOCKS_BIN="${TUN2SOCKS_BIN:-tun2socks}"
+FWD_CHAIN="${FWD_CHAIN:-VMSOCKS_FORWARD}"
+V6_FWD_CHAIN="${V6_FWD_CHAIN:-VMSOCKS6_FORWARD}"
+BLOCK_HOST_DNS="${BLOCK_HOST_DNS:-1}"
+BLOCK_VM_IPV6="${BLOCK_VM_IPV6:-1}"
+RUN_DIR="${VM_SOCKS_RUN_DIR:-/run/vm-socks5-pat}"
+START_TIMEOUT="${VM_SOCKS_START_TIMEOUT:-10}"
+CHECK_IP="${VM_SOCKS_CHECK_IP:-1.1.1.1}"
+CHECK_URL="${VM_SOCKS_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
+CHECK_HOST="${VM_SOCKS_CHECK_HOST:-cloudflare.com}"
+CHECK_TIMEOUT="${VM_SOCKS_CHECK_TIMEOUT:-10}"
+WATCH_INTERVAL="${VM_SOCKS_WATCH_INTERVAL:-30}"
+WATCH_FAILURES="${VM_SOCKS_WATCH_FAILURES:-2}"
+LOG_LEVEL="${VM_SOCKS_LOG_LEVEL:-info}"
+FAILURES=0
+
+usage() {
+    cat <<USAGE
+Usage:
+  sudo $0 up [socks5://[user:password@]host:port | proxy-url-file]
+  sudo $0 down|status|check|repair|watch|trace|dump
+  sudo $0 debug on|off
+
+Commands:
+  up       Start/restart tun2socks and route the VM subnet through it.
+  down     Stop the managed daemon, remove its rules and restore sysctls.
+  status   Show process, tunnel, policy routing and firewall counters.
+  check    Check leak protection, then test TCP and UDP DNS through the TUN.
+  repair   Restart using saved settings, then run check.
+  watch    Check continuously and repair after repeated failures.
+  trace    Capture VM and SOCKS5 endpoint traffic (requires tcpdump).
+  dump     Print diagnostics and the last 80 daemon log lines.
+  debug    Restart with debug (on) or info (off) logging.
+
+Environment overrides (gateway settings are saved until down):
+  VM_BRIDGE=${VM_BRIDGE}  VM_CIDR=${VM_CIDR}
+  SOCKS_IF=${SOCKS_IF}  SOCKS_ADDR=${SOCKS_ADDR}  SOCKS_MTU=${SOCKS_MTU}
+  SOCKS_TABLE=${SOCKS_TABLE}  SOCKS_RULE_PRIO=${SOCKS_RULE_PRIO}
+  SOCKS5_PROXY        SOCKS5 URL; first up defaults to socks5://127.0.0.1:1080.
+  SOCKS5_PROXY_FILE   Private file containing one SOCKS5 URL.
+  TUN2SOCKS_BIN       xjasonlyu/tun2socks v2 executable; default tun2socks.
+  BLOCK_HOST_DNS=${BLOCK_HOST_DNS}  BLOCK_VM_IPV6=${BLOCK_VM_IPV6}
+  FWD_CHAIN=${FWD_CHAIN}  V6_FWD_CHAIN=${V6_FWD_CHAIN}
+  VM_SOCKS_RUN_DIR=${RUN_DIR}
+  VM_SOCKS_START_TIMEOUT=${START_TIMEOUT}
+  VM_SOCKS_CHECK_URL=${CHECK_URL}
+  VM_SOCKS_CHECK_IP=${CHECK_IP}  VM_SOCKS_CHECK_HOST=${CHECK_HOST}
+  VM_SOCKS_CHECK_TIMEOUT=${CHECK_TIMEOUT}
+  VM_SOCKS_WATCH_INTERVAL=${WATCH_INTERVAL}  VM_SOCKS_WATCH_FAILURES=${WATCH_FAILURES}
+  VM_SOCKS_LOG_LEVEL=${LOG_LEVEL}
+
+Requires Linux, xjasonlyu/tun2socks v2, iproute2, iptables, Python 3,
+ip6tables (by default), and curl for active checks. Install tun2socks from:
+  https://github.com/xjasonlyu/tun2socks/releases
+
+TCP and UDP use SOCKS5; UDP requires UDP ASSOCIATE support on the proxy.
+ICMP/ping and other IP protocols are blocked. Configure external DNS inside
+the VM (e.g. 1.1.1.1); its queries then use SOCKS5 UDP relay. Host DNS and
+default routes are unchanged. Local proxies on 127.0.0.1 are supported.
+Stop any other vm-*-pat gateway for this subnet before up.
+Failed startup retains leak protection until an explicit down.
+USAGE
+}
+
+die() { echo >&2 "ERROR: $*"; return 1; }
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root."; }
+require_tun() { [[ -c /dev/net/tun ]] || die "Linux TUN device /dev/net/tun is unavailable."; }
+
+require_cmds() {
+    local cmd missing=0
+    for cmd in ip iptables sysctl python3 awk grep realpath flock nohup env readlink; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo >&2 "Missing required command: ${cmd}"
+            missing=1
+        fi
+    done
+    [[ "${missing}" -eq 0 ]]
+}
+
+validate_settings() {
+    local name value
+    for name in VM_BRIDGE SOCKS_IF; do
+        value="${!name}"
+        [[ "${value}" =~ ^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,14}$ ]] ||
+            die "${name} must be a Linux interface name of at most 15 characters." || return
+    done
+    [[ "${SOCKS_IF}" != "${VM_BRIDGE}" ]] || die "Tunnel and bridge must differ." || return
+    for name in FWD_CHAIN V6_FWD_CHAIN; do
+        [[ "${!name}" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,27}$ ]] ||
+            die "${name} must be a valid dedicated iptables chain name." || return
+        case "${!name}" in
+            INPUT|OUTPUT|FORWARD|PREROUTING|POSTROUTING) die "${name} must be a custom chain."; return 1 ;;
+        esac
+    done
+    [[ "${SOCKS_TABLE}" =~ ^[0-9]{1,9}$ ]] &&
+        (( 10#${SOCKS_TABLE} > 0 && 10#${SOCKS_TABLE} != 253 &&
+           10#${SOCKS_TABLE} != 254 && 10#${SOCKS_TABLE} != 255 )) ||
+        die "SOCKS_TABLE must be a dedicated numeric table (not 0, 253, 254 or 255)." || return
+    [[ "${SOCKS_RULE_PRIO}" =~ ^[0-9]{1,5}$ ]] &&
+        (( 10#${SOCKS_RULE_PRIO} > 0 && 10#${SOCKS_RULE_PRIO} < 32766 )) ||
+        die "SOCKS_RULE_PRIO must be between 1 and 32765." || return
+    SOCKS_TABLE="$((10#${SOCKS_TABLE}))"
+    SOCKS_RULE_PRIO="$((10#${SOCKS_RULE_PRIO}))"
+    [[ "${SOCKS_MTU}" =~ ^[0-9]{3,4}$ ]] &&
+        (( 10#${SOCKS_MTU} >= 576 && 10#${SOCKS_MTU} <= 9000 )) ||
+        die "SOCKS_MTU must be between 576 and 9000." || return
+    SOCKS_MTU="$((10#${SOCKS_MTU}))"
+    python3 - "${VM_CIDR}" "${SOCKS_ADDR}" "${CHECK_IP}" "${CHECK_HOST}" <<'PY' || return
+import ipaddress
+import sys
+try:
+    subnet = ipaddress.IPv4Network(sys.argv[1], strict=True)
+    tunnel = ipaddress.IPv4Interface(sys.argv[2])
+    resolver = ipaddress.IPv4Address(sys.argv[3])
+    if subnet.prefixlen == 0 or subnet.overlaps(tunnel.network):
+        raise ValueError("VM_CIDR must be non-default and must not overlap SOCKS_ADDR")
+    if tunnel.ip.is_loopback or tunnel.ip.is_multicast or tunnel.ip.is_unspecified:
+        raise ValueError("SOCKS_ADDR must be a unicast address")
+    if resolver in subnet or resolver in tunnel.network or resolver.is_loopback or resolver.is_multicast or resolver.is_unspecified:
+        raise ValueError("VM_SOCKS_CHECK_IP must be an external unicast IPv4 DNS resolver")
+    labels = sys.argv[4].rstrip(".").split(".")
+    if not labels or any(not label or len(label.encode("idna")) > 63 for label in labels):
+        raise ValueError("Invalid VM_SOCKS_CHECK_HOST")
+except (ValueError, UnicodeError) as exc:
+    sys.exit(f"ERROR: {exc}")
+PY
+    for name in BLOCK_HOST_DNS BLOCK_VM_IPV6; do
+        [[ "${!name}" =~ ^[01]$ ]] || die "${name} must be 0 or 1." || return
+    done
+    for name in START_TIMEOUT CHECK_TIMEOUT WATCH_INTERVAL WATCH_FAILURES; do
+        [[ "${!name}" =~ ^[1-9][0-9]{0,3}$ ]] || die "${name} must be a positive integer." || return
+    done
+    case "${LOG_LEVEL}" in
+        debug|info|warn|error|silent) ;;
+        *) die "VM_SOCKS_LOG_LEVEL must be debug, info, warn, error or silent."; return 1 ;;
+    esac
+    [[ "${CHECK_URL}" =~ ^https?:// ]] || die "VM_SOCKS_CHECK_URL must be an HTTP(S) URL." || return
+}
+
+prepare_runtime() {
+    [[ "${RUN_DIR}" =~ ^/[a-zA-Z0-9_./-]+$ && "${RUN_DIR}" != / ]] ||
+        die "VM_SOCKS_RUN_DIR must be an absolute path without whitespace." || return
+    [[ "$(realpath -m -- "${RUN_DIR}")" == "${RUN_DIR}" ]] ||
+        die "VM_SOCKS_RUN_DIR must be a canonical path without symlinks." || return
+    [[ ! -e "${RUN_DIR}" || ( -d "${RUN_DIR}" && -O "${RUN_DIR}" ) ]] ||
+        die "Runtime directory must be owned by root: ${RUN_DIR}" || return
+    mkdir -p -- "${RUN_DIR}" || return
+    chmod 700 -- "${RUN_DIR}" || return
+    exec 9>"${RUN_DIR}/lock"
+    flock -n 9 || die "Another vm-socks5-pat command is running." || return
+}
+
+load_settings() {
+    local key value
+    [[ -r "${RUN_DIR}/settings" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            VM_BRIDGE|VM_CIDR|SOCKS_IF|SOCKS_ADDR|SOCKS_MTU|SOCKS_TABLE|SOCKS_RULE_PRIO|TUN2SOCKS_BIN|FWD_CHAIN|V6_FWD_CHAIN|BLOCK_HOST_DNS|BLOCK_VM_IPV6|LOG_LEVEL)
+                printf -v "${key}" '%s' "${value}" ;;
+        esac
+    done < "${RUN_DIR}/settings"
+}
+
+save_settings() {
+    local key
+    for key in VM_BRIDGE VM_CIDR SOCKS_IF SOCKS_ADDR SOCKS_MTU SOCKS_TABLE SOCKS_RULE_PRIO TUN2SOCKS_BIN FWD_CHAIN V6_FWD_CHAIN BLOCK_HOST_DNS BLOCK_VM_IPV6 LOG_LEVEL; do
+        printf '%s=%s\n' "${key}" "${!key}"
+    done > "${RUN_DIR}/settings.new"
+    mv -f -- "${RUN_DIR}/settings.new" "${RUN_DIR}/settings"
+}
+
+proxy_config() {
+    # JSON is also valid YAML; using the standard library avoids a PyYAML
+    # dependency and safely quotes credentials. Never print the unredacted URL.
+    VM_SOCKS_PROXY_INPUT="${SOCKS5_PROXY}" VM_SOCKS_PROXY_FILE_INPUT="${SOCKS5_PROXY_FILE}" \
+        python3 - "$1" "${RUN_DIR}/tun2socks.yaml" "${SOCKS_IF}" "${SOCKS_MTU}" "${LOG_LEVEL}" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
+
+try:
+    mode, filename, interface, mtu, level = sys.argv[1:]
+    path = Path(filename)
+    if mode == "write":
+        proxy_file = os.environ["VM_SOCKS_PROXY_FILE_INPUT"]
+        url = os.environ["VM_SOCKS_PROXY_INPUT"]
+        if proxy_file:
+            url = Path(proxy_file).read_text().strip()
+        elif not url:
+            # A failed startup may have saved its candidate before networking
+            # was ready. Preserve that proxy when repair retries the setup.
+            saved = Path(filename + ".new")
+            if not saved.exists():
+                saved = path
+            url = json.loads(saved.read_text())["proxy"] if saved.exists() else "socks5://127.0.0.1:1080"
+    else:
+        url = json.loads(path.read_text())["proxy"]
+    if any(ord(c) <= 32 or ord(c) == 127 for c in url) or re.search(r"%(?![0-9a-fA-F]{2})", url):
+        raise ValueError("Proxy URL contains whitespace, control characters or invalid percent escapes")
+    parsed = urlsplit(url)
+    host, port = parsed.hostname, parsed.port
+    if parsed.scheme != "socks5" or not host or not port or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError("Expected socks5://[user:password@]host:port (IPv6 hosts use brackets)")
+    if ":" in host:
+        ipaddress.IPv6Address(host)
+    elif not re.fullmatch(r"[a-zA-Z0-9_.-]+", host):
+        raise ValueError("Invalid SOCKS5 proxy hostname")
+    if parsed.username is not None:
+        username = unquote(parsed.username, errors="strict").encode()
+        password = unquote(parsed.password or "", errors="strict").encode()
+        if not 1 <= len(username) <= 255 or not 1 <= len(password) <= 255:
+            raise ValueError("SOCKS5 username and password must each be 1..255 bytes")
+    if mode == "write":
+        address = f"[{host}]" if ":" in host else host
+        auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if parsed.username is not None else ""
+        url = f"socks5://{auth}{address}:{port}"
+        config = {"device": f"tun://{interface}", "proxy": url, "mtu": int(mtu), "loglevel": level}
+        candidate = Path(filename + ".new")
+        candidate.write_text(json.dumps(config, indent=2) + "\n")
+        candidate.chmod(0o600)
+    elif mode == "endpoint":
+        print(host, port)
+    elif mode == "show":
+        address = f"[{host}]" if ":" in host else host
+        auth = " (authentication enabled)" if parsed.username is not None else ""
+        print(f"socks5://{address}:{port}{auth}")
+    else:
+        raise ValueError("Unknown proxy config operation")
+except (OSError, ValueError, KeyError, UnicodeError):
+    # Parser exceptions can include the original URL; keep credentials private.
+    sys.exit("ERROR: Cannot read/validate proxy config. Use one valid socks5://[user:password@]host:port URL.")
+PY
+}
+
+ipt() { iptables -w "$@"; }
+ip6t() { ip6tables -w "$@"; }
+
+ipt_once() {
+    local operation="$1" table="$2" chain="$3"
+    shift 3
+    ipt -t "${table}" -C "${chain}" "$@" 2>/dev/null ||
+        ipt -t "${table}" "${operation}" "${chain}" "$@"
+}
+
+ipt_delete_all() {
+    local table="$1" chain="$2"
+    shift 2
+    while ipt -t "${table}" -D "${chain}" "$@" 2>/dev/null; do :; done
+}
+
+install_firewall() {
+    local protocol direction
+    # Keep a live chain intact during repair so there is no forwarding gap.
+    ipt -N "${FWD_CHAIN}" 2>/dev/null || ipt -S "${FWD_CHAIN}" >/dev/null || return
+    ipt_once -A filter "${FWD_CHAIN}" -i "${SOCKS_IF}" -o "${VM_BRIDGE}" -d "${VM_CIDR}" \
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return
+    for protocol in tcp udp; do
+        ipt_once -A filter "${FWD_CHAIN}" -i "${VM_BRIDGE}" -s "${VM_CIDR}" -o "${SOCKS_IF}" -p "${protocol}" -j ACCEPT || return
+    done
+    ipt_once -A filter "${FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp-net-unreachable || return
+    ipt_once -A filter "${FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp-port-unreachable || return
+    for direction in -i -o; do
+        ipt_once -I filter FORWARD "${direction}" "${VM_BRIDGE}" -j "${FWD_CHAIN}" || return
+    done
+    ipt_once -I nat POSTROUTING -s "${VM_CIDR}" -o "${SOCKS_IF}" -j MASQUERADE || return
+    ipt_once -A mangle FORWARD -s "${VM_CIDR}" -o "${SOCKS_IF}" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || return
+    if [[ "${BLOCK_HOST_DNS}" == 1 ]]; then
+        for protocol in udp tcp; do
+            ipt_once -I filter INPUT -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT || return
+        done
+    fi
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        ip6t -N "${V6_FWD_CHAIN}" 2>/dev/null || ip6t -S "${V6_FWD_CHAIN}" >/dev/null || return
+        for direction in -i -o; do
+            ip6t -C "${V6_FWD_CHAIN}" "${direction}" "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited 2>/dev/null ||
+                ip6t -A "${V6_FWD_CHAIN}" "${direction}" "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited || return
+            ip6t -C FORWARD "${direction}" "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" 2>/dev/null ||
+                ip6t -I FORWARD 1 "${direction}" "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" || return
+        done
+    fi
+    if [[ "${BLOCK_HOST_DNS}" == 1 ]] && command -v ip6tables >/dev/null 2>&1; then
+        for protocol in udp tcp; do
+            ip6t -C INPUT -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT 2>/dev/null ||
+                ip6t -I INPUT 1 -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT || return
+        done
+    fi
+    return 0
+}
+
+remove_firewall() {
+    local direction protocol
+    for direction in -i -o; do
+        ipt_delete_all filter FORWARD "${direction}" "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    done
+    ipt -F "${FWD_CHAIN}" 2>/dev/null || true
+    ipt -X "${FWD_CHAIN}" 2>/dev/null || true
+    ipt_delete_all nat POSTROUTING -s "${VM_CIDR}" -o "${SOCKS_IF}" -j MASQUERADE
+    ipt_delete_all mangle FORWARD -s "${VM_CIDR}" -o "${SOCKS_IF}" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    for protocol in udp tcp; do
+        ipt_delete_all filter INPUT -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT
+    done
+    if command -v ip6tables >/dev/null 2>&1; then
+        for direction in -i -o; do
+            while ip6t -D FORWARD "${direction}" "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}" 2>/dev/null; do :; done
+        done
+        ip6t -F "${V6_FWD_CHAIN}" 2>/dev/null || true
+        ip6t -X "${V6_FWD_CHAIN}" 2>/dev/null || true
+        for protocol in udp tcp; do
+            while ip6t -D INPUT -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT 2>/dev/null; do :; done
+        done
+    fi
+}
+
+inspect_policy_rules() {
+    local rules
+    rules="$(ip -4 -N -j rule show)" || return
+    python3 - "$1" "${VM_CIDR}" "${SOCKS_TABLE}" "${SOCKS_RULE_PRIO}" "${rules}" "${RUN_DIR}/settings" <<'PY'
+import ipaddress
+import json
+import os
+import sys
+mode, cidr, table, priority, snapshot, settings = sys.argv[1:]
+subnet, priority = ipaddress.IPv4Network(cidr), int(priority)
+found = False
+for rule in json.loads(snapshot):
+    # iproute2 uses a string table ID and separate src/srclen fields. Also
+    # accept versions that include the prefix directly in the source string.
+    source = rule.get("src", "all")
+    if source == "all":
+        source = "0.0.0.0/0"
+    elif "/" not in source:
+        source = ("0.0.0.0" if source == "0" else source) + f"/{rule.get('srclen', 32)}"
+    source = ipaddress.IPv4Network(source, strict=False)
+    restricted = any(key in rule for key in (
+        "not", "dst", "fwmark", "fwmask", "iif", "oif", "l3mdev", "uid_start",
+        "ipproto", "sport", "sport_start", "dport", "dport_start", "tos",
+        "suppress_prefixlen", "suppress_ifgroup", "goto", "action"))
+    exact = (source == subnet and str(rule.get("table")) == table
+             and rule.get("priority") == priority and not restricted)
+    if exact:
+        found = True
+        if mode == "exists" or os.path.isfile(settings):
+            continue
+    if mode == "conflicts" and (rule.get("priority") == priority or str(rule.get("table")) == table
+                                or (source.prefixlen and source.overlaps(subnet))):
+        sys.exit(f"ERROR: Conflicting policy rule: {rule}. Stop the other VM gateway first.")
+if mode == "exists":
+    sys.exit(not found)
+PY
+}
+
+policy_rule_exists() { inspect_policy_rules exists; }
+
+install_policy() {
+    ip -4 route replace blackhole default table "${SOCKS_TABLE}" metric 32767 || return
+    ip -4 route replace "${VM_CIDR}" dev "${VM_BRIDGE}" table "${SOCKS_TABLE}" scope link || return
+    if ! policy_rule_exists; then
+        ip -4 rule add priority "${SOCKS_RULE_PRIO}" from "${VM_CIDR}" table "${SOCKS_TABLE}" || return
+    fi
+}
+
+remove_tun_route() {
+    ip -4 route del default dev "${SOCKS_IF}" table "${SOCKS_TABLE}" metric 100 2>/dev/null || true
+}
+
+remove_policy() {
+    while ip -4 rule del priority "${SOCKS_RULE_PRIO}" from "${VM_CIDR}" table "${SOCKS_TABLE}" 2>/dev/null; do :; done
+    remove_tun_route
+    ip -4 route del "${VM_CIDR}" dev "${VM_BRIDGE}" table "${SOCKS_TABLE}" scope link 2>/dev/null || true
+    ip -4 route del blackhole default table "${SOCKS_TABLE}" metric 32767 2>/dev/null || true
+}
+
+save_sysctls() {
+    [[ ! -e "${RUN_DIR}/sysctls" ]] || return 0
+    local key value snapshot=""
+    for key in net.ipv4.ip_forward net.ipv4.conf.all.rp_filter "net/ipv4/conf/${VM_BRIDGE}/rp_filter"; do
+        value="$(sysctl -n "${key}")" || return
+        snapshot+="${key}=${value}"$'\n'
+    done
+    printf '%s' "${snapshot}" > "${RUN_DIR}/sysctls.new"
+    mv -f -- "${RUN_DIR}/sysctls.new" "${RUN_DIR}/sysctls"
+}
+
+configure_sysctls() {
+    save_sysctls || return
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null || return
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || return
+    sysctl -w "net/ipv4/conf/${VM_BRIDGE}/rp_filter=0" >/dev/null || return
+}
+
+restore_sysctls() {
+    local key value
+    [[ -r "${RUN_DIR}/sysctls" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            net.ipv4.ip_forward|net.ipv4.conf.all.rp_filter|"net/ipv4/conf/${VM_BRIDGE}/rp_filter")
+                [[ "${value}" =~ ^[0-9]+$ ]] || die "Invalid saved sysctl value." || return
+                # A bridge can disappear when the VMs are stopped.
+                if [[ "${key}" == "net/ipv4/conf/${VM_BRIDGE}/rp_filter" ]] && ! ip link show "${VM_BRIDGE}" >/dev/null 2>&1; then continue; fi
+                sysctl -w "${key}=${value}" >/dev/null || return ;;
+        esac
+    done < "${RUN_DIR}/sysctls"
+    rm -f -- "${RUN_DIR}/sysctls"
+}
+
+owns_interface() {
+    [[ -r "/sys/class/net/${SOCKS_IF}/ifalias" ]] || return 1
+    [[ "$(<"/sys/class/net/${SOCKS_IF}/ifalias")" == "vm-socks5-pat:${RUN_DIR}" ]]
+}
+
+daemon_pid() {
+    local pid executable argument found=0 expect_config=0
+    [[ -r "${RUN_DIR}/tun2socks.pid" ]] || return 1
+    read -r pid < "${RUN_DIR}/tun2socks.pid" || return 1
+    [[ "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 1 && -r "/proc/${pid}/cmdline" ]] || return 1
+    executable="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || return 1
+    [[ "${executable% (deleted)}" == "${TUN2SOCKS_BIN}" ]] || return 1
+    while IFS= read -r -d '' argument; do
+        if (( expect_config )); then
+            [[ "${argument}" != "${RUN_DIR}/tun2socks.yaml" ]] || found=1
+            expect_config=0
+        fi
+        [[ "${argument}" != --config ]] || expect_config=1
+    done < "/proc/${pid}/cmdline"
+    (( found )) && kill -0 "${pid}" 2>/dev/null || return 1
+    printf '%s\n' "${pid}"
+}
+
+daemon_ready() {
+    local pid descriptor
+    pid="$(daemon_pid)" || return 1
+    # An alive process does not mean it has successfully opened the TUN.
+    for descriptor in "/proc/${pid}/fdinfo/"*; do
+        if awk -v interface="${SOCKS_IF}" '$1 == "iff:" && $2 == interface {found=1} END {exit !found}' "${descriptor}" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
+
+stop_daemon() {
+    local pid attempt recorded_pid
+    if pid="$(daemon_pid)"; then
+        kill -TERM "${pid}" || return
+        for ((attempt=0; attempt<10; attempt++)); do
+            if ! daemon_pid >/dev/null; then break; fi
+            sleep 1
+        done
+        if daemon_pid >/dev/null; then die "tun2socks did not stop; keeping gateway protection."; return 1; fi
+    elif [[ -r "${RUN_DIR}/tun2socks.pid" ]]; then
+        read -r recorded_pid < "${RUN_DIR}/tun2socks.pid" || true
+        if [[ "${recorded_pid:-}" =~ ^[0-9]+$ ]] && kill -0 "${recorded_pid}" 2>/dev/null; then
+            die "PID file refers to an unrelated process; refusing to signal it."
+            return 1
+        fi
+    fi
+    rm -f -- "${RUN_DIR}/tun2socks.pid"
+    remove_tun_route
+}
+
+check_conflicts() {
+    local routes
+    inspect_policy_rules conflicts || return
+    if ip link show "${SOCKS_IF}" >/dev/null 2>&1 && ! owns_interface; then
+        die "${SOCKS_IF} exists and is not owned by this script; choose another SOCKS_IF."
+        return 1
+    fi
+    if [[ ! -r "${RUN_DIR}/settings" ]]; then
+        routes="$(ip -4 route show table "${SOCKS_TABLE}" 2>/dev/null || true)"
+        [[ -z "${routes}" ]] || die "Policy table ${SOCKS_TABLE} is already in use." || return
+        if ipt -S "${FWD_CHAIN}" >/dev/null 2>&1; then die "Firewall chain ${FWD_CHAIN} is already in use."; return 1; fi
+        if command -v ip6tables >/dev/null 2>&1 && ip6t -S "${V6_FWD_CHAIN}" >/dev/null 2>&1; then
+            die "Firewall chain ${V6_FWD_CHAIN} is already in use."; return 1
+        fi
+    fi
+}
+
+start_daemon() {
+    local pid deadline="$((SECONDS + START_TIMEOUT))"
+    # Close the command lock in the daemon and protect it from terminal hangups.
+    env -u SOCKS5_PROXY -u SOCKS5_PROXY_FILE nohup "${TUN2SOCKS_BIN}" --config "${RUN_DIR}/tun2socks.yaml" \
+        </dev/null >>"${RUN_DIR}/tun2socks.log" 2>&1 9>&- &
+    pid=$!
+    printf '%s\n' "${pid}" > "${RUN_DIR}/tun2socks.pid"
+    disown "${pid}"
+    while (( SECONDS < deadline )); do
+        if daemon_ready; then return 0; fi
+        if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+        sleep 1
+    done
+    die "tun2socks did not open ${SOCKS_IF} within ${START_TIMEOUT}s. VM traffic remains blocked; see ${RUN_DIR}/tun2socks.log."
+}
+
+up() {
+    ip link show "${VM_BRIDGE}" >/dev/null 2>&1 || die "VM bridge ${VM_BRIDGE} does not exist; run virtstart first." || return
+    require_tun || return
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        command -v ip6tables >/dev/null 2>&1 || die "ip6tables is required when BLOCK_VM_IPV6=1." || return
+    fi
+    check_conflicts || return
+    TUN2SOCKS_BIN="$(command -v -- "${TUN2SOCKS_BIN}")" || die "Install xjasonlyu/tun2socks v2 or set TUN2SOCKS_BIN." || return
+    TUN2SOCKS_BIN="$(realpath -e -- "${TUN2SOCKS_BIN}")" || return
+    [[ "${TUN2SOCKS_BIN}" != *$'\n'* && "${TUN2SOCKS_BIN}" != *$'\r'* ]] || die "Invalid tun2socks executable path." || return
+    # Validate credentials before disturbing a working gateway.
+    proxy_config write || return
+    save_settings || return
+    install_firewall || return
+    install_policy || return
+    configure_sysctls || return
+    stop_daemon || return
+    mv -f -- "${RUN_DIR}/tun2socks.yaml.new" "${RUN_DIR}/tun2socks.yaml" || return
+    if ! ip link show "${SOCKS_IF}" >/dev/null 2>&1; then
+        ip tuntap add dev "${SOCKS_IF}" mode tun || return
+        ip link set dev "${SOCKS_IF}" alias "vm-socks5-pat:${RUN_DIR}" || return
+    fi
+    ip -4 addr replace "${SOCKS_ADDR}" dev "${SOCKS_IF}" || return
+    ip link set dev "${SOCKS_IF}" mtu "${SOCKS_MTU}" up || return
+    sysctl -w "net/ipv4/conf/${SOCKS_IF}/rp_filter=0" >/dev/null || return
+    echo "Starting VM SOCKS5 gateway..."
+    if ! start_daemon; then stop_daemon || true; return 1; fi
+    ip -4 route replace default dev "${SOCKS_IF}" table "${SOCKS_TABLE}" metric 100 || return
+    echo "VM SOCKS5 gateway is up."
+    echo "  VM subnet: ${VM_CIDR} via ${VM_BRIDGE}"
+    echo "  Proxy:     $(proxy_config show)"
+    echo "  Tunnel:    ${SOCKS_IF}, policy table ${SOCKS_TABLE}, priority ${SOCKS_RULE_PRIO}"
+    echo "  Log:       ${RUN_DIR}/tun2socks.log"
+    echo "UDP requires proxy UDP relay support. Run: sudo $0 check"
+}
+
+down() {
+    if [[ ! -r "${RUN_DIR}/settings" ]]; then echo "VM SOCKS5 gateway is already down."; return 0; fi
+    # Verify ownership before stopping a process or touching networking.
+    if ip link show "${SOCKS_IF}" >/dev/null 2>&1 && ! owns_interface; then
+        die "${SOCKS_IF} is no longer owned by this script; keeping protection."
+        return 1
+    fi
+    stop_daemon || return
+    if owns_interface; then ip tuntap del dev "${SOCKS_IF}" mode tun || return; fi
+    restore_sysctls || return
+    remove_policy
+    remove_firewall
+    rm -f -- "${RUN_DIR}/settings" "${RUN_DIR}/settings.new" "${RUN_DIR}/tun2socks.yaml" \
+        "${RUN_DIR}/tun2socks.yaml.new" "${RUN_DIR}/sysctls.new"
+    echo "VM SOCKS5 gateway is down. Logs remain in ${RUN_DIR}/tun2socks.log."
+}
+
+bridge_ip() {
+    ip -4 -o addr show dev "${VM_BRIDGE}" scope global |
+        awk 'NR == 1 {split($4, address, "/"); print address[1]}'
+}
+
+status() {
+    local pid
+    echo "VM SOCKS5 gateway: ${VM_CIDR} via ${VM_BRIDGE}"
+    if [[ ! -r "${RUN_DIR}/settings" ]]; then echo "State: down"; return 0; fi
+    echo "Proxy: $(proxy_config show || true)"
+    if pid="$(daemon_pid)"; then echo "tun2socks: running (PID ${pid}, ${LOG_LEVEL} logging)"; else echo "tun2socks: DOWN"; fi
+    ip -s link show dev "${SOCKS_IF}" 2>/dev/null || true
+    echo "Policy rules:"
+    ip -4 -N rule show
+    echo "Policy table ${SOCKS_TABLE}:"
+    ip -4 route show table "${SOCKS_TABLE}" 2>/dev/null || true
+    echo "Forwarding counters:"
+    ipt -L "${FWD_CHAIN}" -n -v 2>/dev/null || true
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then ip6t -L "${V6_FWD_CHAIN}" -n -v 2>/dev/null || true; fi
+    echo "Log: ${RUN_DIR}/tun2socks.log"
+}
+
+print_ok() { printf '[OK] %s\n' "$*"; }
+print_fail() { printf '[FAIL] %s\n' "$*"; FAILURES=$((FAILURES + 1)); }
+check_cmd() {
+    local description="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then print_ok "${description}"; else print_fail "${description}"; fi
+}
+
+check_firewall() {
+    local direction protocol
+    for direction in -i -o; do
+        check_cmd "IPv4 bridge forwarding hook (${direction})" ipt -C FORWARD "${direction}" "${VM_BRIDGE}" -j "${FWD_CHAIN}"
+    done
+    for protocol in tcp udp; do
+        check_cmd "VM -> SOCKS5 TUN (${protocol})" ipt -C "${FWD_CHAIN}" -i "${VM_BRIDGE}" -s "${VM_CIDR}" -o "${SOCKS_IF}" -p "${protocol}" -j ACCEPT
+    done
+    check_cmd "Established TUN -> VM replies" ipt -C "${FWD_CHAIN}" -i "${SOCKS_IF}" -o "${VM_BRIDGE}" -d "${VM_CIDR}" \
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    check_cmd "VM kill switch / unsupported protocols blocked" ipt -C "${FWD_CHAIN}" -i "${VM_BRIDGE}" -j REJECT --reject-with icmp-net-unreachable
+    check_cmd "Unsolicited inbound traffic blocked" ipt -C "${FWD_CHAIN}" -o "${VM_BRIDGE}" -j REJECT --reject-with icmp-port-unreachable
+    check_cmd "VM PAT/MASQUERADE" ipt -t nat -C POSTROUTING -s "${VM_CIDR}" -o "${SOCKS_IF}" -j MASQUERADE
+    check_cmd "TCP MSS clamp" ipt -t mangle -C FORWARD -s "${VM_CIDR}" -o "${SOCKS_IF}" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    if [[ "${BLOCK_HOST_DNS}" == 1 ]]; then
+        for protocol in udp tcp; do
+            check_cmd "Host IPv4 DNS leak protection (${protocol})" ipt -C INPUT -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT
+            if command -v ip6tables >/dev/null 2>&1; then
+                check_cmd "Host IPv6 DNS leak protection (${protocol})" ip6t -C INPUT -i "${VM_BRIDGE}" -p "${protocol}" --dport 53 -j REJECT
+            fi
+        done
+    fi
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then
+        for direction in -i -o; do
+            check_cmd "IPv6 bridge hook (${direction})" ip6t -C FORWARD "${direction}" "${VM_BRIDGE}" -j "${V6_FWD_CHAIN}"
+            check_cmd "VM IPv6 kill switch (${direction})" ip6t -C "${V6_FWD_CHAIN}" "${direction}" "${VM_BRIDGE}" -j REJECT --reject-with icmp6-adm-prohibited
+        done
+    fi
+}
+
+probe_dns() {
+    python3 - "$1" "${CHECK_IP}" "${CHECK_HOST}" "${CHECK_TIMEOUT}" <<'PY'
+import os
+import socket
+import struct
+import sys
+try:
+    source, resolver, host, timeout = sys.argv[1:]
+    transaction = os.urandom(2)
+    labels = [label.encode("idna") for label in host.rstrip(".").split(".")]
+    question = b"".join(bytes([len(label)]) + label for label in labels) + b"\0\0\1\0\1"
+    packet = transaction + struct.pack("!5H", 0x0100, 1, 0, 0, 0) + question
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(int(timeout))
+        sock.bind((source, 0))
+        sock.connect((resolver, 53))
+        sock.send(packet)
+        response = sock.recv(4096)
+    if len(response) < 12 or response[:2] != transaction:
+        raise ValueError("Invalid DNS response")
+    flags, _, answers, _, _ = struct.unpack("!5H", response[2:12])
+    if not flags & 0x8000 or flags & 0x000f or not answers:
+        raise ValueError("DNS query failed or returned no answers")
+except (OSError, ValueError, UnicodeError) as exc:
+    sys.exit(f"UDP DNS probe failed: {exc}")
+PY
+}
+
+probe_tcp() {
+    local source="$1" endpoint host port address route
+    endpoint="$(python3 - "${CHECK_URL}" <<'PY'
+import socket
+import sys
+from urllib.parse import urlsplit
+try:
+    url = urlsplit(sys.argv[1])
+    port = url.port or (443 if url.scheme == "https" else 80)
+    address = socket.getaddrinfo(url.hostname, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+    print(url.hostname, port, address)
+except (OSError, ValueError, IndexError):
+    sys.exit("Cannot resolve the TCP health-check destination to IPv4")
+PY
+    )" || return
+    read -r host port address <<<"${endpoint}"
+    route="$(ip -4 route get "${address}" from "${source}" 2>&1)" || return
+    [[ " ${route} " == *" dev ${SOCKS_IF} "* ]] || die "TCP probe destination bypasses the TUN: ${route}" || return
+    # Pin the checked destination so DNS or a more specific route cannot make
+    # curl exercise a different path. Disable curl config and proxy overrides.
+    curl -q --ipv4 --interface "${source}" --noproxy '*' --proxy '' \
+        --resolve "${host}:${port}:${address}" --connect-timeout "${CHECK_TIMEOUT}" \
+        --max-time "${CHECK_TIMEOUT}" --fail --silent --show-error \
+        --output /dev/null "${CHECK_URL}"
+}
+
+check() {
+    local routes source route key host port endpoint family ip_address active_failures
+    FAILURES=0
+    [[ -r "${RUN_DIR}/settings" ]] || die "Gateway is down; run up first." || return
+    command -v curl >/dev/null 2>&1 || die "curl is required for active checks." || return
+    check_cmd "VM bridge exists" ip link show "${VM_BRIDGE}"
+    check_cmd "TUN is owned by this gateway" owns_interface
+    check_cmd "tun2socks owns an open TUN descriptor" daemon_ready
+    check_cmd "VM source policy rule" policy_rule_exists
+    routes="$(ip -4 route show table "${SOCKS_TABLE}" 2>/dev/null || true)"
+    check_cmd "Default route uses SOCKS5 TUN" grep -Fq "default dev ${SOCKS_IF} " <<<"${routes}"
+    check_cmd "Blackhole fallback" grep -q '^blackhole default' <<<"${routes}"
+    check_cmd "VM subnet route" grep -Fq "${VM_CIDR%/32} dev ${VM_BRIDGE} " <<<"${routes}"
+    for key in net.ipv4.conf.all.rp_filter "net/ipv4/conf/${VM_BRIDGE}/rp_filter" "net/ipv4/conf/${SOCKS_IF}/rp_filter"; do
+        if [[ "$(sysctl -n "${key}" 2>/dev/null || true)" == 0 ]]; then print_ok "${key}=0"; else print_fail "${key} must be 0"; fi
+    done
+    if [[ "$(sysctl -n net.ipv4.ip_forward)" == 1 ]]; then print_ok "IPv4 forwarding enabled"; else print_fail "IPv4 forwarding disabled"; fi
+    check_firewall
+    endpoint="$(proxy_config endpoint)" || return
+    read -r host port <<<"${endpoint}"
+    ip_address="$(python3 - "${host}" "${port}" <<'PY'
+import socket
+import sys
+try:
+    print(socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), type=socket.SOCK_STREAM)[0][4][0])
+except OSError:
+    sys.exit(1)
+PY
+    )" || ip_address=""
+    if [[ -n "${ip_address}" ]]; then
+        family=-4
+        [[ "${ip_address}" != *:* ]] || family=-6
+        if route="$(ip "${family}" route get "${ip_address}" 2>&1)" && [[ " ${route} " != *" dev ${SOCKS_IF} "* ]]; then
+            print_ok "Proxy endpoint uses host routing: ${route}"
+        else
+            print_fail "Proxy endpoint route is unavailable or loops through the TUN: ${route}"
+        fi
+    else
+        print_fail "Cannot resolve SOCKS5 proxy hostname"
+    fi
+    source="$(bridge_ip || true)"
+    if [[ -z "${source}" ]]; then
+        print_fail "Cannot determine bridge IPv4 source address"
+    else
+        # Verify the actual source route before probing. A host-bound request
+        # without this check could misleadingly succeed through the host uplink.
+        if route="$(ip -4 route get "${CHECK_IP}" from "${source}" 2>&1)" && [[ " ${route} " == *" dev ${SOCKS_IF} "* ]]; then
+            print_ok "Traffic from ${source} uses ${SOCKS_IF}"
+        else
+            print_fail "Traffic from ${source} bypasses the TUN or cannot route: ${route}"
+        fi
+        if (( FAILURES == 0 )); then
+            active_failures="${FAILURES}"
+            # Binding to the bridge IP exercises the VM source routing.
+            if probe_tcp "${source}"; then
+                print_ok "TCP HTTP(S) connectivity through SOCKS5 TUN"
+            else
+                print_fail "TCP connectivity through SOCKS5 TUN"
+            fi
+            if probe_dns "${source}"; then
+                print_ok "UDP DNS through SOCKS5 TUN (${CHECK_HOST} via ${CHECK_IP})"
+            else
+                print_fail "UDP DNS through SOCKS5 TUN; check proxy UDP ASSOCIATE support"
+            fi
+            if (( FAILURES > active_failures )); then echo "See ${RUN_DIR}/tun2socks.log for relay errors."; fi
+        else
+            echo "Skipping active probes until routing and leak protection checks pass."
+        fi
+    fi
+    echo "Health check: ${FAILURES} failure(s). ICMP/ping is unsupported by SOCKS5."
+    (( FAILURES == 0 ))
+}
+
+restart_gateway() {
+    local script
+    script="$(realpath -e -- "${BASH_SOURCE[0]}")" || return
+    # Fresh Bash keeps errexit effective when watch calls repair in a condition.
+    bash -e -c 'source "$1"; RUN_DIR="$2"; load_settings; validate_settings; up' \
+        vm-socks5-pat "${script}" "${RUN_DIR}"
+}
+
+repair() {
+    [[ -r "${RUN_DIR}/settings" ]] || die "No saved gateway settings; run up first." || return
+    # Repair uses the saved proxy, regardless of a caller's proxy environment.
+    SOCKS5_PROXY="" SOCKS5_PROXY_FILE="" restart_gateway || return
+    check
+}
+
+watch() {
+    local failures=0
+    [[ -r "${RUN_DIR}/settings" ]] || die "Gateway is down; run up first." || return
+    echo "Watching every ${WATCH_INTERVAL}s; repair after ${WATCH_FAILURES} failures. Ctrl-C stops watch."
+    flock -u 9
+    while true; do
+        if ! flock -n 9; then sleep "${WATCH_INTERVAL}"; continue; fi
+        load_settings
+        if [[ ! -r "${RUN_DIR}/settings" ]]; then
+            echo "Gateway is down; stopping watch."
+            flock -u 9
+            return 0
+        fi
+        if check; then
+            failures=0
+        else
+            failures=$((failures + 1))
+            echo "Consecutive failures: ${failures}/${WATCH_FAILURES}"
+            if (( failures >= WATCH_FAILURES )); then
+                if repair; then failures=0; else echo "Automatic repair failed; see ${RUN_DIR}/tun2socks.log."; fi
+            fi
+        fi
+        flock -u 9
+        sleep "${WATCH_INTERVAL}"
+    done
+}
+
+trace() {
+    local filter="net ${VM_CIDR}" host port endpoint address
+    command -v tcpdump >/dev/null 2>&1 || die "tcpdump is required for trace." || return
+    endpoint="$(proxy_config endpoint)" || return
+    read -r host port <<<"${endpoint}"
+    address="$(getent ahosts "${host}" 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+    if [[ "${address}" =~ ^[0-9a-fA-F:.]+$ ]]; then filter="${filter} or host ${address}"; fi
+    echo "Capturing VM and SOCKS5 traffic: ${filter} (UDP relay may use a different endpoint)."
+    flock -u 9
+    tcpdump -ni any "${filter}"
+}
+
+debug() {
+    [[ -r "${RUN_DIR}/settings" ]] || die "Gateway is down; run up first." || return
+    if [[ "$1" == on ]]; then LOG_LEVEL=debug; else LOG_LEVEL=info; fi
+    save_settings || return
+    SOCKS5_PROXY="" SOCKS5_PROXY_FILE="" restart_gateway || return
+    echo "Logging is ${LOG_LEVEL}. Follow: tail -f ${RUN_DIR}/tun2socks.log"
+}
+
+dump() {
+    status
+    echo "Host IPv4 routing table:"
+    ip -4 route show table main
+    echo "Host IPv6 routing table:"
+    ip -6 route show table main
+    echo "Gateway firewall rules:"
+    ipt -S "${FWD_CHAIN}" 2>/dev/null || true
+    if [[ "${BLOCK_VM_IPV6}" == 1 ]]; then ip6t -S "${V6_FWD_CHAIN}" 2>/dev/null || true; fi
+    echo "Last 80 tun2socks log lines:"
+    tail -n 80 "${RUN_DIR}/tun2socks.log" 2>/dev/null || true
+}
+
+main() {
+    local action="${1:-}"
+    case "${action}" in
+        -h|--help|help|"") usage; return 0 ;;
+        up|start|enable) [[ $# -le 2 ]] || die "Usage: $0 up [socks5-url | proxy-url-file]" || return 64 ;;
+        debug) [[ $# == 2 && ( "$2" == on || "$2" == off ) ]] || die "Usage: $0 debug on|off" || return 64 ;;
+        down|stop|disable|status|check|repair|watch|trace|dump) [[ $# == 1 ]] || die "Unexpected arguments for ${action}." || return 64 ;;
+        *) usage >&2; return 64 ;;
+    esac
+    require_root
+    require_cmds
+    umask 077
+    prepare_runtime
+    load_settings
+    if [[ "${action}" =~ ^(up|start|enable)$ && $# == 2 ]]; then
+        if [[ "$2" == socks5://* ]]; then SOCKS5_PROXY="$2"; SOCKS5_PROXY_FILE="";
+        else SOCKS5_PROXY=""; SOCKS5_PROXY_FILE="$2"; fi
+    fi
+    validate_settings
+    case "${action}" in
+        up|start|enable) up ;;
+        down|stop|disable) down ;;
+        status) status ;;
+        check) check ;;
+        repair) repair ;;
+        watch) watch ;;
+        trace) trace ;;
+        dump) dump ;;
+        debug) debug "$2" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
